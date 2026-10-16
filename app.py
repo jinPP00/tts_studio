@@ -851,6 +851,24 @@ def auto_recognize_text(audio_path: Path) -> str:
             content = txt_path.read_text(encoding="utf-8").strip()
             if content and not content.endswith(","):
                 return content
+    # .txt 대사 파일이 없는 신규 샘플은 첫 13초 구간을 자동 음성 인식(STT)하여 대사 파일 생성
+    try:
+        import speech_recognition as sr_mod
+        wav_13s = prepare_10s_wav(audio_path)
+        recognizer = sr_mod.Recognizer()
+        with sr_mod.AudioFile(str(wav_13s)) as source:
+            audio_data = recognizer.record(source, duration=13.0)
+        recognized = recognizer.recognize_google(audio_data, language="ko-KR").strip()
+        if recognized:
+            for d in (G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR):
+                try:
+                    if d.exists():
+                        (d / f"{audio_path.stem}.txt").write_text(recognized, encoding="utf-8")
+                except Exception:
+                    pass
+            return recognized
+    except Exception:
+        pass
     return ""
 
 
@@ -1064,23 +1082,7 @@ def on_upload_new_file(uploaded_file, current_name: str):
     return Path(uploaded_file).stem
 
 
-def save_ref_text_on_edit(voice_name: str, ref_text: str):
-    if not voice_name or voice_name.startswith("("):
-        return gr.update()
-    clean_ref = (ref_text or "").strip()
-    if not clean_ref:
-        return gr.update()
-    audio_path = find_sample_path(voice_name)
-    for d in (G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR):
-        try:
-            if d.exists():
-                (d / f"{audio_path.stem}.txt").write_text(clean_ref, encoding="utf-8")
-        except Exception:
-            pass
-    return f"샘플 대사 자동 저장됨 · {audio_path.stem}.txt"
-
-
-def save_new_sample(uploaded_file, custom_name, ref_text_input=""):
+def save_new_sample(uploaded_file, custom_name):
     if not uploaded_file:
         return gr.update(), gr.update(), gr.update(), "", "오디오 파일을 먼저 업로드하세요."
     src = Path(uploaded_file)
@@ -1098,13 +1100,14 @@ def save_new_sample(uploaded_file, custom_name, ref_text_input=""):
         shutil.copy2(dst_local, G_DRIVE_SAMPLE_DIR / filename)
     except Exception:
         pass
-    ref_text = (ref_text_input or "").strip() or auto_recognize_text(dst_local)
-    if ref_text:
-        for d in (G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR):
+    for d in (G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR):
+        old_txt = d / f"{dst_local.stem}.txt"
+        if old_txt.exists() and dst_local.name != DEFAULT_VOICE_NAME:
             try:
-                (d / f"{dst_local.stem}.txt").write_text(ref_text, encoding="utf-8")
+                old_txt.unlink()
             except Exception:
                 pass
+    ref_text = auto_recognize_text(dst_local)
     choices = get_sample_files()
     return (
         gr.update(choices=choices, value=filename),
@@ -1807,6 +1810,7 @@ initial_badge_html = (
 with gr.Blocks(title="Voice Studio") as demo:
     sample_path_state = gr.State(initial_sample_path)
     output_path_state = gr.State(initial_latest_out_path)
+    ref_text_state = gr.State(initial_ref_text)
 
     # 상단 헤더 바 (한 줄 고정: 로고 · 상태 배지 · 코랩 시동/종료/새로고침)
     with gr.Row(elem_classes="studio-topbar"):
@@ -1843,12 +1847,7 @@ with gr.Blocks(title="Voice Studio") as demo:
 
             sample_audio_html = gr.HTML(value=initial_preview_html)
 
-            with gr.Accordion("새 목소리 추가 · 샘플 대사 수정", open=False):
-                ref_text_box = gr.Textbox(
-                    value=initial_ref_text,
-                    lines=2,
-                    label="샘플 대사",
-                )
+            with gr.Accordion("새 목소리 추가", open=False):
                 new_upload = gr.Audio(sources=["upload"], type="filepath", label="오디오 업로드")
                 with gr.Row(elem_classes="inline-row"):
                     new_name = gr.Textbox(
@@ -1951,13 +1950,7 @@ with gr.Blocks(title="Voice Studio") as demo:
     voice_dropdown.change(
         fn=on_voice_select,
         inputs=[voice_dropdown],
-        outputs=[sample_audio_html, ref_text_box, sample_path_state],
-        queue=False,
-    )
-    ref_text_box.blur(
-        fn=save_ref_text_on_edit,
-        inputs=[voice_dropdown, ref_text_box],
-        outputs=[status_box],
+        outputs=[sample_audio_html, ref_text_state, sample_path_state],
         queue=False,
     )
     new_upload.upload(
@@ -1987,7 +1980,7 @@ with gr.Blocks(title="Voice Studio") as demo:
     refresh_btn.click(
         fn=refresh_all,
         inputs=[output_dir_box],
-        outputs=[voice_dropdown, sample_audio_html, ref_text_box, sample_path_state, colab_url_box, colab_status_txt, history_table],
+        outputs=[voice_dropdown, sample_audio_html, ref_text_state, sample_path_state, colab_url_box, colab_status_txt, history_table],
         queue=False,
     )
     open_sample_btn.click(
@@ -2006,8 +1999,8 @@ with gr.Blocks(title="Voice Studio") as demo:
     colab_kill_btn.click(fn=shutdown_remote_colab, inputs=[colab_url_box], outputs=[colab_status_txt, status_box], queue=False)
     save_sample_btn.click(
         fn=save_new_sample,
-        inputs=[new_upload, new_name, ref_text_box],
-        outputs=[voice_dropdown, sample_audio_html, ref_text_box, sample_path_state, status_box],
+        inputs=[new_upload, new_name],
+        outputs=[voice_dropdown, sample_audio_html, ref_text_state, sample_path_state, status_box],
         queue=False,
     )
     speed_slider.release(
@@ -2027,7 +2020,7 @@ with gr.Blocks(title="Voice Studio") as demo:
         fn=generate_cloned_voice,
         inputs=[
             voice_dropdown,
-            ref_text_box,
+            ref_text_state,
             target_text_box,
             custom_prefix_box,
             speed_slider,
