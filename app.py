@@ -369,10 +369,10 @@ def get_colab_client(url: str) -> Client:
 def render_status_badge(text: str, is_online: bool = True) -> str:
     dot_color = "#10B981" if is_online else "#52525B"
     bg_color = "#ECFDF5" if is_online else "#F4F4F5"
-    border_color = "rgba(16, 185, 129, 0.25)" if is_online else "rgba(15, 23, 42, 0.08)"
+    border_color = "rgba(16, 185, 129, 0.3)" if is_online else "#D4D4D8"
     text_color = "#065F46" if is_online else "#27272A"
     return f"""
-    <div style="display:flex;align-items:center;justify-content:center;gap:8px;background:{bg_color};border:1px solid {border_color};border-radius:999px;padding:8px 16px;font-size:13px;font-weight:600;color:{text_color};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+    <div style="display:inline-flex;align-items:center;gap:8px;background:{bg_color};border:1px solid {border_color};border-radius:999px;padding:6px 14px;font-size:13px;font-weight:600;color:{text_color};white-space:nowrap;max-width:100%;">
         <span style="width:8px;height:8px;border-radius:50%;background:{dot_color};flex-shrink:0;display:inline-block;"></span>
         <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{text}</span>
     </div>
@@ -383,8 +383,8 @@ def get_status_label(force_refresh: bool = False) -> str:
     url = get_colab_url(force_refresh=force_refresh)
     if url:
         short_host = url.replace("https://", "").replace("http://", "").split("/")[0]
-        return render_status_badge(f"코랩 T4 GPU 가속 연결됨 · {short_host}", is_online=True)
-    return render_status_badge("내 PC 단독 엔진 준비 완료 (코랩 없이 바로 생성)", is_online=False)
+        return render_status_badge(f"코랩 GPU 연결됨 · {short_host}", is_online=True)
+    return render_status_badge("내 PC 단독 모드 (코랩 없이 즉시 생성)", is_online=False)
 
 
 def apply_fish_speed_patch():
@@ -1210,9 +1210,9 @@ body, .gradio-container {
 }
 
 .gradio-container {
-    max-width: 1220px !important;
+    max-width: 1200px !important;
     margin: 0 auto !important;
-    padding: 24px 24px 48px 24px !important;
+    padding: 14px 20px 24px 20px !important;
 }
 
 footer { display: none !important; }
@@ -1221,13 +1221,27 @@ footer { display: none !important; }
 label, .block label, [data-testid="block-info"], .label-wrap, .label-wrap span {
     color: #18181B !important;
     font-weight: 600 !important;
-    font-size: 13.5px !important;
+    font-size: 13px !important;
     white-space: nowrap !important;
 }
 
 input, textarea, select, .single-select, .wrap-inner, .secondary-wrap {
     color: #18181B !important;
     background-color: #F8F8F7 !important;
+    font-size: 13.5px !important;
+}
+
+/* 드롭다운 내부 입력창이 중간에서 잘리지 않고 끝까지 표시되도록 보정 */
+.wrap-inner, .secondary-wrap {
+    width: 100% !important;
+    display: flex !important;
+    align-items: center !important;
+}
+.secondary-wrap input {
+    width: 100% !important;
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    text-overflow: ellipsis !important;
 }
 
 /* 드롭다운 메뉴 및 선택값 글자색 강제 지정 */
@@ -1241,24 +1255,26 @@ ul.options li:hover, ul.options li.selected {
     font-weight: 700 !important;
 }
 
-/* 라디오 버튼 & 체크박스: 검은 배경 절대 금지! 선택 시 밝은 블루(#EEF2FF) 배경 + 진한 글자(#1E3A8A)로 100% 가독성 보장 */
+/* 라디오 버튼 & 체크박스: 한 줄(한 단락) 배치 및 선택 시 밝은 블루(#EEF2FF) + 진한 네이비(#1E3A8A) */
 .wrap {
-    gap: 8px !important;
+    gap: 6px !important;
     display: flex !important;
-    flex-wrap: wrap !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
 }
 label.svelte-1p9xokt, .gradio-radio label, .gradio-checkbox label, fieldset label {
     background: #F4F4F5 !important;
     color: #18181B !important;
     border: 1.5px solid #D4D4D8 !important;
-    border-radius: 10px !important;
-    padding: 7px 13px !important;
+    border-radius: 9px !important;
+    padding: 6px 12px !important;
     font-weight: 600 !important;
     font-size: 13px !important;
     white-space: nowrap !important;
     word-break: keep-all !important;
     cursor: pointer !important;
     transition: all 0.12s ease !important;
+    margin: 0 !important;
 }
 label.svelte-1p9xokt span, .gradio-radio label span, .gradio-checkbox label span, fieldset label span {
     color: #18181B !important;
@@ -1271,7 +1287,7 @@ fieldset label:has(input:checked) {
     background: #EEF2FF !important;
     color: #1E3A8A !important;
     border: 1.5px solid #2563EB !important;
-    box-shadow: 0 1px 4px rgba(37, 99, 235, 0.12) !important;
+    box-shadow: 0 1px 3px rgba(37, 99, 235, 0.12) !important;
 }
 label.svelte-1p9xokt.selected span,
 .gradio-radio label.selected span,
@@ -1285,13 +1301,13 @@ input[type="radio"], input[type="checkbox"] {
     accent-color: #2563EB !important;
 }
 
-/* 데이터프레임 / 테이블 검은배경에 검은글자 문제 완전 해결 */
+/* 데이터프레임 / 테이블 가독성 보장 */
 table, thead, tbody, tr, th, td,
 .table-wrap, .svelte-1b7421c, [data-testid="dataframe"], [data-testid="dataframe"] * {
     background-color: #FFFFFF !important;
     color: #18181B !important;
     border-color: #E4E4E7 !important;
-    font-size: 13px !important;
+    font-size: 12.5px !important;
 }
 thead th, thead tr th, .header-row th {
     background-color: #F4F4F5 !important;
@@ -1313,89 +1329,147 @@ tbody tr:hover td {
     background: transparent !important;
 }
 
-/* 상단 헤더 바 */
+/* 상단 헤더 바: 무조건 한 줄(한 단락) 고정 */
 .studio-topbar {
     background: #FFFFFF !important;
     border: 1px solid #E4E4E7 !important;
-    border-radius: 16px !important;
-    padding: 12px 20px !important;
-    margin-bottom: 20px !important;
-    box-shadow: 0 2px 10px rgba(15, 23, 42, 0.03) !important;
+    border-radius: 14px !important;
+    padding: 10px 18px !important;
+    margin-bottom: 14px !important;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.03) !important;
+    display: flex !important;
+    flex-wrap: nowrap !important;
     align-items: center !important;
+    justify-content: space-between !important;
+    gap: 10px !important;
+}
+.studio-topbar > * {
+    min-width: 0 !important;
+}
+.studio-topbar button {
+    flex: 0 0 auto !important;
+    min-width: 84px !important;
+    width: auto !important;
+    padding: 7px 14px !important;
+    height: 36px !important;
 }
 
 .brand-header {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 9px;
     white-space: nowrap;
 }
 .brand-dot {
-    width: 10px;
-    height: 10px;
+    width: 9px;
+    height: 9px;
     border-radius: 50%;
     background: #2563EB;
-    box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
     flex-shrink: 0;
 }
 .brand-title {
-    font-size: 17px;
+    font-size: 16px;
     font-weight: 700;
     color: #18181B !important;
-    letter-spacing: -0.025em;
+    letter-spacing: -0.02em;
     margin: 0;
 }
 .brand-sub {
     font-size: 12px;
     color: #52525B !important;
     font-weight: 600;
-    margin-left: 6px;
+    margin-left: 4px;
 }
 
 /* 좌우 메인 카드 패널 */
 .studio-card {
     background: #FFFFFF !important;
     border: 1px solid #E4E4E7 !important;
-    border-radius: 18px !important;
-    padding: 24px !important;
-    box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.04) !important;
-    gap: 14px !important;
+    border-radius: 16px !important;
+    padding: 18px 20px !important;
+    box-shadow: 0 4px 16px -2px rgba(15, 23, 42, 0.04) !important;
+    gap: 10px !important;
 }
 
 .section-heading {
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: #52525B !important;
-    margin: 0 0 2px 0;
+    letter-spacing: 0.02em;
+    color: #3F3F46 !important;
+    margin: 0;
     display: flex;
     align-items: center;
     justify-content: space-between;
     white-space: nowrap;
 }
 .section-heading span {
-    color: #52525B !important;
+    color: #3F3F46 !important;
 }
 
 .section-divider {
     height: 1px;
     background: #E4E4E7;
-    margin: 8px 0;
+    margin: 4px 0;
+}
+
+/* 한 줄 인라인 컨트롤 행 (드롭다운+폴더버튼, 경로창+변경/열기 버튼) */
+.inline-row {
+    display: flex !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    gap: 8px !important;
+}
+.inline-row > * {
+    min-width: 0 !important;
+}
+.inline-row button {
+    flex: 0 0 auto !important;
+    width: auto !important;
+    min-width: 82px !important;
+    height: 40px !important;
+    padding: 0 13px !important;
+}
+.single-line-path textarea, .single-line-path input {
+    height: 40px !important;
+    min-height: 40px !important;
+    max-height: 40px !important;
+    padding: 8px 12px !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    resize: none !important;
+    line-height: 22px !important;
+    border-radius: 9px !important;
+}
+
+/* 합성 실행 버튼 행 (꽉 차는 한 줄 배치) */
+.action-row {
+    display: flex !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    gap: 10px !important;
+}
+.action-row > button.primary {
+    flex: 4 1 0% !important;
+}
+.action-row > button.stop {
+    flex: 1 1 0% !important;
+    max-width: 130px !important;
 }
 
 /* 커스텀 오디오 플레이어 카드 */
 .audio-player-card {
     background: #F8F8F7;
     border: 1px solid #E4E4E7;
-    border-radius: 14px;
-    padding: 14px 16px;
+    border-radius: 12px;
+    padding: 10px 14px;
 }
 .audio-card-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 10px;
+    margin-bottom: 6px;
     gap: 8px;
 }
 .audio-title-wrap {
@@ -1410,12 +1484,13 @@ tbody tr:hover td {
     color: #FFFFFF !important;
     font-size: 11px;
     font-weight: 600;
-    padding: 3px 8px;
+    padding: 2px 8px;
     border-radius: 6px;
     white-space: nowrap;
+    flex-shrink: 0;
 }
 .audio-filename {
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 600;
     color: #18181B !important;
     overflow: hidden;
@@ -1440,8 +1515,8 @@ tbody tr:hover td {
     text-decoration: none !important;
     font-size: 11.5px;
     font-weight: 600;
-    padding: 4px 10px;
-    border-radius: 7px;
+    padding: 3px 9px;
+    border-radius: 6px;
 }
 .audio-dl-btn:hover {
     background: #2563EB !important;
@@ -1450,7 +1525,7 @@ tbody tr:hover td {
 }
 .studio-audio-el {
     width: 100%;
-    height: 38px;
+    height: 34px;
     display: block;
     border-radius: 8px;
 }
@@ -1459,12 +1534,12 @@ tbody tr:hover td {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 16px 18px;
+    padding: 12px 14px;
     border: 1px dashed #D4D4D8;
-    border-radius: 14px;
+    border-radius: 12px;
     background: #FAFAFA;
     color: #52525B !important;
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 500;
 }
 .audio-empty-dot {
@@ -1479,10 +1554,10 @@ tbody tr:hover td {
 .script-editor textarea {
     background: #F8F8F7 !important;
     border: 1px solid #D4D4D8 !important;
-    border-radius: 14px !important;
-    padding: 16px 18px !important;
-    font-size: 15.5px !important;
-    line-height: 1.65 !important;
+    border-radius: 12px !important;
+    padding: 12px 14px !important;
+    font-size: 15px !important;
+    line-height: 1.55 !important;
     color: #18181B !important;
 }
 .script-editor textarea:focus {
@@ -1491,17 +1566,17 @@ tbody tr:hover td {
     box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1) !important;
 }
 
-/* 주요 실행 버튼: 짙은 네이비/블루(#1D4ED8) + 흰색 글자로 검은배경+검은글자 원천 차단 */
+/* 주요 실행 버튼 */
 button.primary {
     background: #1D4ED8 !important;
     color: #FFFFFF !important;
     border: none !important;
-    border-radius: 12px !important;
-    font-size: 15px !important;
+    border-radius: 11px !important;
+    font-size: 14.5px !important;
     font-weight: 700 !important;
-    min-height: 48px !important;
+    min-height: 44px !important;
     white-space: nowrap !important;
-    box-shadow: 0 4px 12px rgba(29, 78, 216, 0.2) !important;
+    box-shadow: 0 3px 10px rgba(29, 78, 216, 0.18) !important;
 }
 button.primary, button.primary *, button.primary span {
     color: #FFFFFF !important;
@@ -1514,9 +1589,9 @@ button.secondary, button.stop {
     background: #F4F4F5 !important;
     color: #18181B !important;
     border: 1px solid #D4D4D8 !important;
-    border-radius: 10px !important;
+    border-radius: 9px !important;
     font-weight: 600 !important;
-    font-size: 13px !important;
+    font-size: 12.5px !important;
     white-space: nowrap !important;
 }
 button.secondary *, button.stop * {
@@ -1527,17 +1602,20 @@ button.secondary:hover, button.stop:hover {
     color: #09090B !important;
 }
 .main-stop-btn {
-    min-height: 48px !important;
-    border-radius: 12px !important;
+    min-height: 44px !important;
+    border-radius: 11px !important;
 }
 
 /* 상태 알림 바 */
 .status-toast textarea, .status-toast input {
     background: #F4F4F5 !important;
     border: 1px solid #E4E4E7 !important;
-    border-radius: 10px !important;
-    padding: 10px 14px !important;
-    font-size: 13px !important;
+    border-radius: 9px !important;
+    padding: 8px 12px !important;
+    height: 36px !important;
+    min-height: 36px !important;
+    max-height: 36px !important;
+    font-size: 12.5px !important;
     font-weight: 600 !important;
     color: #18181B !important;
 }
@@ -1545,9 +1623,12 @@ button.secondary:hover, button.stop:hover {
 /* 아코디언 정돈 */
 .gradio-accordion {
     border: 1px solid #E4E4E7 !important;
-    border-radius: 12px !important;
+    border-radius: 10px !important;
     background: #FAFAFA !important;
     overflow: hidden !important;
+}
+.gradio-accordion > .label-wrap {
+    padding: 8px 12px !important;
 }
 """
 
@@ -1564,101 +1645,110 @@ with gr.Blocks(title="Voice Studio") as demo:
     sample_path_state = gr.State(initial_sample_path)
     output_path_state = gr.State(initial_latest_out_path)
 
-    # 상단 헤더 바
-    with gr.Row(elem_classes="studio-topbar", equal_height=True):
-        with gr.Column(scale=3, min_width=190):
-            gr.HTML(
-                """
-                <div class="brand-header">
-                    <div class="brand-dot"></div>
-                    <div>
-                        <span class="brand-title">Voice Studio</span>
-                        <span class="brand-sub">1.5</span>
-                    </div>
+    # 상단 헤더 바 (한 줄 고정: 로고 · 상태 배지 · 코랩 시동/종료/새로고침)
+    with gr.Row(elem_classes="studio-topbar"):
+        gr.HTML(
+            """
+            <div class="brand-header">
+                <div class="brand-dot"></div>
+                <div>
+                    <span class="brand-title">Voice Studio</span>
+                    <span class="brand-sub">1.5</span>
                 </div>
-                """
-            )
-        with gr.Column(scale=5, min_width=280):
-            colab_status_txt = gr.HTML(value=get_status_label())
-        colab_btn = gr.Button("코랩 시동", variant="secondary", size="sm", scale=0)
-        colab_kill_btn = gr.Button("코랩 종료", variant="secondary", size="sm", scale=0)
-        refresh_btn = gr.Button("새로고침", variant="secondary", size="sm", scale=0)
+            </div>
+            """
+        )
+        colab_status_txt = gr.HTML(value=get_status_label())
+        colab_btn = gr.Button("코랩 시동", variant="secondary", size="sm")
+        colab_kill_btn = gr.Button("코랩 종료", variant="secondary", size="sm")
+        refresh_btn = gr.Button("새로고침", variant="secondary", size="sm")
 
-    # 메인 2단 레이아웃 (한 화면에 들어오도록 컴팩트 구성)
+    # 메인 2단 레이아웃 (한 화면에 스크롤 없이 들어오도록 한 단락씩 압축)
     with gr.Row(equal_height=False):
         # 좌측: 목소리 & 저장 폴더
-        with gr.Column(scale=4, elem_classes="studio-card"):
-            gr.HTML('<div class="section-heading"><span>01 · 목소리</span></div>')
-            voice_dropdown = gr.Dropdown(
-                choices=initial_choices,
-                value=initial_voice,
-                label="목소리 선택",
-                container=True,
-            )
-            sample_audio_html = gr.HTML(value=initial_preview_html)
-            open_sample_btn = gr.Button("📂 샘플 폴더 열기", variant="secondary", size="sm")
+        with gr.Column(scale=5, elem_classes="studio-card"):
+            gr.HTML('<div class="section-heading"><span>01 · 목소리 샘플</span></div>')
+            with gr.Row(elem_classes="inline-row"):
+                voice_dropdown = gr.Dropdown(
+                    choices=initial_choices,
+                    value=initial_voice,
+                    show_label=False,
+                    container=False,
+                    scale=4,
+                )
+                open_sample_btn = gr.Button("📂 샘플 폴더", variant="secondary", size="sm", scale=1)
 
-            with gr.Accordion("새 목소리 추가 / 대사 수정", open=False):
+            sample_audio_html = gr.HTML(value=initial_preview_html)
+
+            with gr.Accordion("새 목소리 추가 · 샘플 대사 수정", open=False):
                 ref_text_box = gr.Textbox(
                     value=initial_ref_text,
                     lines=2,
                     label="샘플 대사",
                 )
-                new_upload = gr.Audio(sources=["upload"], type="filepath", label="오디오 파일 업로드")
-                with gr.Row():
-                    new_name = gr.Textbox(placeholder="이름 입력", label="저장 이름", scale=2)
-                    save_sample_btn = gr.Button("저장", variant="secondary", scale=1)
+                new_upload = gr.Audio(sources=["upload"], type="filepath", label="오디오 업로드")
+                with gr.Row(elem_classes="inline-row"):
+                    new_name = gr.Textbox(placeholder="저장할 목소리 이름", lines=1, max_lines=1, show_label=False, container=False, scale=3, elem_classes="single-line-path")
+                    save_sample_btn = gr.Button("목소리 등록", variant="secondary", size="sm", scale=1)
 
             gr.HTML('<div class="section-divider"></div>')
             gr.HTML('<div class="section-heading"><span>02 · 저장 폴더</span></div>')
             folder_preset_radio = gr.Radio(
                 choices=["바탕화면", "다운로드", "G드라이브"],
                 value="바탕화면" if str(initial_out_dir) == str(DESKTOP_OUT_DIR) else None,
-                label="저장 위치",
+                show_label=False,
+                container=False,
             )
-            output_dir_box = gr.Textbox(value=str(initial_out_dir), label="폴더 경로")
-            with gr.Row():
-                browse_folder_btn = gr.Button("위치 변경", variant="secondary", size="sm")
-                open_output_btn = gr.Button("📂 저장 폴더 열기", variant="secondary", size="sm")
+            with gr.Row(elem_classes="inline-row"):
+                output_dir_box = gr.Textbox(
+                    value=str(initial_out_dir),
+                    lines=1,
+                    max_lines=1,
+                    show_label=False,
+                    container=False,
+                    scale=4,
+                    elem_classes="single-line-path",
+                )
+                browse_folder_btn = gr.Button("변경", variant="secondary", size="sm", scale=1)
+                open_output_btn = gr.Button("📂 폴더 열기", variant="secondary", size="sm", scale=1)
 
         # 우측: 대본 입력 & 결과 오디오
-        with gr.Column(scale=6, elem_classes="studio-card"):
+        with gr.Column(scale=7, elem_classes="studio-card"):
             gr.HTML('<div class="section-heading"><span>03 · 음성 합성</span></div>')
             target_text_box = gr.Textbox(
                 value="안녕하세요. 테스트 음성입니다.",
-                lines=3,
+                lines=2,
                 placeholder="읽힐 대본을 입력하세요.",
-                label="대본 입력",
+                show_label=False,
+                container=False,
                 elem_classes="script-editor",
             )
 
             with gr.Row(equal_height=True):
                 engine_radio = gr.Radio(
-                    choices=["자동 (코랩 우선)", "코랩 GPU", "내 PC"],
-                    value="자동 (코랩 우선)",
-                    label="엔진",
+                    choices=["자동", "코랩 GPU", "내 PC"],
+                    value="자동",
+                    label="합성 엔진 (자동: 코랩 우선)",
                     scale=3,
-                    min_width=300,
                 )
                 speed_slider = gr.Slider(
                     0.8,
                     1.3,
                     value=1.0,
                     step=0.05,
-                    label="배속",
+                    label="재생 배속",
                     scale=2,
-                    min_width=170,
                 )
 
-            with gr.Accordion("상세 설정 (파일명 · 억양 · 무음)", open=False):
+            with gr.Accordion("상세 설정 (파일명 접두어 · 억양 · 무음 제거)", open=False):
                 with gr.Row():
                     custom_prefix_box = gr.Textbox(value="", placeholder="예: 오프닝", label="파일명 접두어")
                     temp_slider = gr.Slider(0.3, 1.0, value=0.6, step=0.05, label="억양 변화 (0.6 권장)")
                 with gr.Row():
                     trim_chk = gr.Checkbox(value=True, label="앞뒤 무음 제거")
-                    colab_url_box = gr.Textbox(value="", placeholder="자동 연결", label="코랩 주소")
+                    colab_url_box = gr.Textbox(value="", placeholder="자동 연결", label="코랩 수동 주소")
 
-            with gr.Row():
+            with gr.Row(elem_classes="action-row"):
                 gen_btn = gr.Button("음성 합성 시작", variant="primary", scale=4)
                 stop_btn = gr.Button("중단", variant="stop", scale=1, elem_classes="main-stop-btn")
 
@@ -1667,6 +1757,7 @@ with gr.Blocks(title="Voice Studio") as demo:
                 show_label=False,
                 container=False,
                 lines=1,
+                max_lines=1,
                 interactive=False,
                 elem_classes="status-toast",
             )
@@ -1675,7 +1766,7 @@ with gr.Blocks(title="Voice Studio") as demo:
             gr.HTML('<div class="section-heading"><span>04 · 완성 오디오</span></div>')
             output_audio_html = gr.HTML(value=initial_output_html)
 
-            with gr.Accordion("최근 생성 목록 (클릭 시 재생)", open=False):
+            with gr.Accordion("최근 생성 목록 (클릭 시 바로 재생)", open=False):
                 history_table = gr.Dataframe(
                     headers=["파일명", "용량", "시각", "경로"],
                     datatype=["str", "str", "str", "str"],
