@@ -848,6 +848,14 @@ def generate_cloned_voice(
                     out_audio_tmp = str(res_audio)
                     used_engine = "구글 코랩 T4 GPU"
                     break
+                elif isinstance(res, (list, tuple)) and len(res) >= 3 and "base64," in str(res[2]):
+                    m_b64 = re.search(r'base64,([A-Za-z0-9+/=]+)', str(res[2]))
+                    if m_b64:
+                        tmp_b64_wav = Path(os.environ.get("TEMP", ".")) / f"colab_b64_{os.getpid()}.wav"
+                        tmp_b64_wav.write_bytes(base64.b64decode(m_b64.group(1)))
+                        out_audio_tmp = str(tmp_b64_wav)
+                        used_engine = "구글 코랩 T4 GPU"
+                        break
 
             elif eng == "local_fish":
                 yield gr.update(), "", "내 PC 로컬 고속 엔진에서 음성 생성 중...", get_saved_files_table(str(out_dir))

@@ -504,8 +504,7 @@ def generate_tts(voice_name, uploaded_file, ref_text, target_text, temp, top_p, 
             out_filename = f"{now_str}_{v_slug}_{clean_preview}.wav"
             out_path = OUTPUT_DIR / out_filename
             sf.write(str(out_path), wav_data, sr, subtype="PCM_16")
-            wav_int16 = (np.clip(wav_data, -1.0, 1.0) * 32767).astype(np.int16)
-            return (sr, wav_int16), f"✅ 완료 ({time.time()-t0:.1f}초): {out_filename}", render_audio_html(out_path, "생성 결과", autoplay=True)
+            return None, f"✅ 완료 ({time.time()-t0:.1f}초): {out_filename}", render_audio_html(out_path, "생성 결과", autoplay=True)
         elif result.code == "error":
             return None, f"오류: {result.error}", render_audio_html(None, "생성 결과")
 
