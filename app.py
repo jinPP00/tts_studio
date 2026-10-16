@@ -929,7 +929,7 @@ def generate_cloned_voice(
 
                 yield gr.update(), "", "코랩 GPU에서 합성 중...", get_saved_files_table(str(out_dir))
                 c_colab = get_colab_client(active_colab_url)
-                upload_arg = handle_file(str(trimmed_path))
+                upload_arg = None if voice_name == DEFAULT_VOICE_NAME else handle_file(str(trimmed_path))
                 try:
                     res = c_colab.predict(
                         voice_name,
