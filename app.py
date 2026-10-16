@@ -77,7 +77,7 @@ def render_audio_html(file_path, label: str = "오디오 미리듣기", autoplay
     if not file_path or not os.path.exists(str(file_path)):
         return f"""
         <div style="padding:10px 12px; border:1px solid #d1d5db; border-radius:6px; background:#f9fafb; color:#6b7280; font-size:13px;">
-            {label}: 재생할 오디오 파일이 없습니다.
+            [{label}] '음성 생성' 버튼을 누르거나 아래 목록에서 파일을 클릭하면 여기에 재생 바가 나타납니다.
         </div>
         """
     try:
