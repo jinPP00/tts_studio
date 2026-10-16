@@ -248,8 +248,8 @@ def get_colab_client(url: str) -> Client:
 def get_status_label(force_refresh: bool = False) -> str:
     url = get_colab_url(force_refresh=force_refresh)
     if url:
-        return f"코랩 연결됨 ({url})"
-    return "코랩 오프라인 (내 PC 로컬 고속 엔진 대기)"
+        return f"🚀 코랩 T4 GPU 연결됨 ({url})"
+    return "🟢 내 PC 단독 모드 준비 완료 (코랩 없이 바로 생성 가능)"
 
 
 def apply_fish_speed_patch():
@@ -950,20 +950,57 @@ def open_sample_folder(sample_file_str: str = ""):
 COLAB_DIRECT_URL = "https://colab.research.google.com/github/jinPP00/tts_studio/blob/main/fish_tts_studio.ipynb"
 
 
-def open_colab_page():
+def _send_colab_autorun_keys():
+    """크롬에서 코랩 탭이 열리면 자동으로 Ctrl+F9(모두 실행) 및 경고창 확인(Tab->Enter) 입력"""
+    if sys.platform != "win32":
+        return
+    try:
+        ps_script = (
+            "$ws = New-Object -ComObject WScript.Shell; "
+            "Start-Sleep -Milliseconds 6500; "
+            "$ws.SendKeys('^{F9}'); "
+            "Start-Sleep -Milliseconds 1500; "
+            "$ws.SendKeys('{TAB}{ENTER}');"
+        )
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        pass
+
+
+def auto_start_colab_from_pc():
+    already_url = get_colab_url(force_refresh=True)
+    if already_url:
+        yield f"🚀 코랩 T4 GPU 연결됨 ({already_url})", "✅ 이미 코랩 GPU가 연결되어 있습니다! 바로 '음성 생성'을 누르세요."
+        return
+
     unlock_windows_foreground()
     try:
         os.startfile(COLAB_DIRECT_URL)
     except Exception:
         import webbrowser
         webbrowser.open(COLAB_DIRECT_URL)
-    return "코랩 노트북을 열었습니다. 코랩 화면에서 ▶ 실행 버튼만 누르면 내 PC와 자동 연결됩니다."
+
+    threading.Thread(target=_send_colab_autorun_keys, daemon=True).start()
+    yield "⏳ 코랩 자동 시동 중...", "1/2 코랩 창을 열고 자동 실행(Ctrl+F9) 신호를 보냈습니다. (기다리는 동안에도 바로 음성 생성이 가능합니다)"
+
+    for sec in range(4, 95, 4):
+        time.sleep(4.0)
+        url = get_colab_url(force_refresh=True)
+        if url:
+            yield f"🚀 코랩 T4 GPU 연결됨 ({url})", f"✅ 코랩 T4 GPU 자동 연결 완료! ({url})"
+            return
+        yield f"⏳ 코랩 시동 대기 중 ({sec}초)...", f"2/2 코랩 서버 준비 중 ({sec}초 경과)... 지금 바로 '음성 생성'을 누르셔도 내 PC 엔진으로 즉시 작동합니다."
+
+    yield get_status_label(force_refresh=True), "내 PC 단독 모드로 언제든 바로 생성 가능합니다. (코랩 창에서 ▶ 버튼이 눌렸는지 확인해 주세요)"
 
 
 def shutdown_remote_colab(colab_url_input: str):
     url = get_colab_url(colab_url_input, force_refresh=True)
     if not url:
-        return "코랩 오프라인 (내 PC 로컬 고속 엔진 대기)", "현재 연결된 코랩 세션이 없습니다."
+        return "🟢 내 PC 단독 모드 준비 완료 (코랩 없이 바로 생성 가능)", "현재 연결된 코랩 세션이 없습니다."
     try:
         c = get_colab_client(url)
         c.predict(api_name="/shutdown_colab")
@@ -979,7 +1016,7 @@ def shutdown_remote_colab(colab_url_input: str):
     save_settings({"colab_url": ""})
     _LAST_COLAB_CHECK["url"] = ""
     _LAST_COLAB_CHECK["ts"] = time.time()
-    return "코랩 오프라인 (내 PC 로컬 고속 엔진 대기)", "코랩 GPU 세션을 반납(종료)했습니다."
+    return "🟢 내 PC 단독 모드 준비 완료 (코랩 없이 바로 생성 가능)", "코랩 GPU 세션을 반납(종료)했습니다."
 
 
 CALM_CSS = """
@@ -1002,8 +1039,8 @@ with gr.Blocks(title="AI 음성 복제 스튜디오") as demo:
 
     with gr.Row(equal_height=True):
         gr.Markdown("### AI 음성 복제 스튜디오")
-        colab_status_txt = gr.Textbox(value=get_status_label(), label="연결 상태", interactive=False, scale=2)
-        colab_btn = gr.Button("코랩 열기", link=COLAB_DIRECT_URL, size="sm", scale=0)
+        colab_status_txt = gr.Textbox(value=get_status_label(), label="현재 동작 모드 (코랩 안 켜도 바로 작동됨)", interactive=False, scale=2)
+        colab_btn = gr.Button("⚡ 코랩 자동 시동", size="sm", scale=0)
         colab_kill_btn = gr.Button("코랩 세션 반납", size="sm", scale=0)
         refresh_btn = gr.Button("새로고침", size="sm", scale=0)
 
@@ -1133,7 +1170,7 @@ with gr.Blocks(title="AI 음성 복제 스튜디오") as demo:
         outputs=[status_box],
         queue=False,
     )
-    colab_btn.click(fn=open_colab_page, inputs=[], outputs=[status_box], queue=False)
+    colab_btn.click(fn=auto_start_colab_from_pc, inputs=[], outputs=[colab_status_txt, status_box], queue=False)
     colab_kill_btn.click(fn=shutdown_remote_colab, inputs=[colab_url_box], outputs=[colab_status_txt, status_box], queue=False)
     save_sample_btn.click(
         fn=save_new_sample,
