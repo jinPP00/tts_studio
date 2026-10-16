@@ -49,6 +49,8 @@ os.chdir('/content/fish-speech-v15')
 if '/content/fish-speech-v15' not in sys.path:
     sys.path.insert(0, '/content/fish-speech-v15')
 
+CKPT_DIR.mkdir(parents=True, exist_ok=True)
+
 subprocess.run([
     sys.executable, '-m', 'pip', 'install', '-q', '--no-deps',
     'einx==0.2.2', 'vector_quantize_pytorch==1.14.24', 'loralib',
@@ -60,7 +62,8 @@ subprocess.run([
     'tiktoken', 'silero-vad', 'gradio', 'soundfile', 'librosa', 'einops', 'python-dotenv'
 ], check=True)
 
-BASE_URL = "https://www.modelscope.cn/models/fishaudio/fish-speech-1.5/resolve/master"
+HF_BASE = "https://huggingface.co/fishaudio/fish-speech-1.5/resolve/main"
+MS_BASE = "https://www.modelscope.cn/models/fishaudio/fish-speech-1.5/resolve/master"
 FILES = [
     "config.json",
     "special_tokens.json",
@@ -68,10 +71,13 @@ FILES = [
     "firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
     "model.pth"
 ]
+CKPT_DIR.mkdir(parents=True, exist_ok=True)
 for fname in FILES:
     fpath = CKPT_DIR / fname
     if not fpath.exists() or fpath.stat().st_size < 500:
-        subprocess.run(['wget', '-q', '-c', f"{BASE_URL}/{fname}", '-O', str(fpath)], check=True)
+        res = subprocess.run(['wget', '-q', '-c', f"{HF_BASE}/{fname}", '-O', str(fpath)])
+        if res.returncode != 0 or not fpath.exists() or fpath.stat().st_size < 500:
+            subprocess.run(['wget', '-q', '-c', f"{MS_BASE}/{fname}", '-O', str(fpath)], check=True)
 
 Path('/content/fish-speech-v15/fish_speech/utils/__init__.py').write_text("""import random
 import numpy as np
