@@ -57,12 +57,12 @@ except Exception:
     pass
 
 DEFAULT_VOICE_NAME = "recording-2026.-10.-16.-오후-1-19-43.wav"
-DEFAULT_REF_TEXT = "아컨텐츠 제작을 위해서 더빙을 해야는데 어떻게 진행을 해야 되는지 고민이시군요 고객님 그러실 때는 타입캐스트를 사용해 보시는 걸 추천드리는데요 다양한 에이아의 캐릭터들과 자연스러운,"
+DEFAULT_REF_TEXT = "아 컨텐츠 제작을 위해서 더빙을 해야 되는데 어떻게 진행을 해야 되는지 고민이시군요 고객님."
 
 # 다른 PC에서 처음 실행해 샘플 폴더가 비어 있을 경우 내장된 기본 샘플 자동 복원
 _default_wav = LOCAL_SAMPLE_DIR / DEFAULT_VOICE_NAME
 _b64_file = STUDIO_DIR / "sample_voice.b64"
-if not _default_wav.exists() and _b64_file.exists():
+if (not _default_wav.exists() or _default_wav.stat().st_size > 700000) and _b64_file.exists():
     try:
         _default_wav.write_bytes(base64.b64decode(_b64_file.read_bytes()))
         (LOCAL_SAMPLE_DIR / "recording-2026.-10.-16.-오후-1-19-43.txt").write_text(
@@ -117,7 +117,7 @@ def pop_explorer_foreground(folder_path: Path, select_file: Path = None):
 
 
 def render_audio_html(file_path, label: str = "오디오 미리듣기", autoplay: bool = False) -> str:
-    """Gradio WaveSurfer 재생 먹통 버그를 완벽히 우회하는 브라우저 기본 HTML5 오디오 플레이어"""
+    """Gradio WaveSurfer 재생 먹통 버그를 완벽히 우회하는 브라우저 기본 HTML5 오디오 플레이어 (단일 Base64)"""
     if not file_path or not os.path.exists(str(file_path)):
         return f"""
         <div style="padding:10px 12px; border:1px solid #d1d5db; border-radius:6px; background:#f9fafb; color:#6b7280; font-size:13px;">
@@ -136,7 +136,7 @@ def render_audio_html(file_path, label: str = "오디오 미리듣기", autoplay
         <div style="padding:10px 12px; border:1px solid #d1d5db; border-radius:6px; background:#ffffff;">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; font-size:13px; color:#374151;">
                 <span style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:75%;">{label} — {p.name}</span>
-                <a href="data:{mime};base64,{b64}" download="{p.name}" style="color:#111827; text-decoration:underline; font-size:12px; font-weight:500;">다운로드</a>
+                <a href="#" onclick="const a=document.createElement('a');a.href=document.getElementById('{uid}').src;a.download='{p.name}';a.click();return false;" style="color:#111827; text-decoration:underline; font-size:12px; font-weight:500;">다운로드</a>
             </div>
             <audio id="{uid}" controls {auto_attr} preload="auto" style="width:100%; height:40px; display:block;" src="data:{mime};base64,{b64}"></audio>
         </div>
@@ -353,13 +353,14 @@ def apply_fish_speed_patch():
                     score = torch.where(score < 0, score * rep_pen, score / rep_pen)
                     logit_1d.scatter_(dim=0, index=previous_tokens, src=score)
                 top_vals, top_idx = torch.topk(logit_1d, 256, dim=-1)
-                temp_val = max(float(sampling_kwargs.get("temperature", 0.7)), 1e-5)
+                sorted_probs = torch.nn.functional.softmax(top_vals, dim=-1)
+                cum_probs = torch.cumsum(sorted_probs, dim=-1)
                 top_p_val = sampling_kwargs.get("top_p", 0.7)
-                probs_top = torch.nn.functional.softmax(top_vals / temp_val, dim=-1)
-                cum_probs = torch.cumsum(probs_top, dim=-1)
                 remove_mask = cum_probs > top_p_val
                 remove_mask[0] = False
-                probs_top = probs_top.masked_fill(remove_mask, 0.0)
+                top_vals = top_vals.masked_fill(remove_mask, -float("Inf"))
+                temp_val = sampling_kwargs.get("temperature", 0.7)
+                probs_top = torch.nn.functional.softmax(top_vals / temp_val, dim=-1)
                 q = torch.empty_like(probs_top).exponential_(1)
                 local_idx = torch.argmax(probs_top / q, dim=-1, keepdim=True)
                 idx_next = top_idx.gather(0, local_idx).to(dtype=torch.int)
@@ -505,9 +506,9 @@ def get_local_fish_engine():
 def get_reference_wav_bytes(audio_path: Path) -> bytes:
     key = f"{audio_path.resolve()}_{audio_path.stat().st_mtime_ns}"
     if key not in _REF_BYTES_CACHE:
-        wav_10s, sr_10s = librosa.load(str(audio_path), sr=44100, mono=True, duration=10.5)
+        wav_ref, sr_ref = librosa.load(str(audio_path), sr=44100, mono=True, duration=6.8)
         buf = io.BytesIO()
-        sf.write(buf, wav_10s, sr_10s, format="WAV")
+        sf.write(buf, wav_ref, sr_ref, format="WAV", subtype="PCM_16")
         _REF_BYTES_CACHE[key] = buf.getvalue()
     return _REF_BYTES_CACHE[key]
 
@@ -521,13 +522,10 @@ def _prewarm_engine_background():
         eng = get_local_fish_engine()
         sample_p = find_sample_path(DEFAULT_VOICE_NAME)
         if sample_p.exists():
+            from fish_speech.utils.schema import ServeReferenceAudio
             ref_bytes = get_reference_wav_bytes(sample_p)
             ref_txt = auto_recognize_text(sample_p)
-            from hashlib import sha256
-            ref_hash = sha256(ref_bytes).hexdigest()
-            if ref_hash not in eng.ref_by_hash:
-                prompt_tokens = eng.encode_reference(ref_bytes)
-                eng.ref_by_hash[ref_hash] = (prompt_tokens, ref_txt)
+            eng.load_by_hash([ServeReferenceAudio(audio=ref_bytes, text=ref_txt)], "on")
     except Exception:
         pass
 
@@ -540,9 +538,9 @@ def prepare_10s_wav(audio_path: Path) -> Path:
                 sampwidth = w.getsampwidth()
                 sr = w.getframerate()
                 n_frames = w.getnframes()
-                if (n_frames / float(sr)) <= 12.0:
+                if (n_frames / float(sr)) <= 7.5:
                     return audio_path
-                raw = w.readframes(int(10.0 * sr))
+                raw = w.readframes(int(6.8 * sr))
             trimmed_path = Path(os.environ.get("TEMP", ".")) / f"trimmed_{audio_path.stem}.wav"
             with wave.open(str(trimmed_path), "wb") as w_out:
                 w_out.setnchannels(n_channels)
@@ -568,7 +566,7 @@ def auto_recognize_text(audio_path: Path) -> str:
         txt_path = d / f"{audio_path.stem}.txt"
         if txt_path.exists():
             content = txt_path.read_text(encoding="utf-8").strip()
-            if content:
+            if content and not content.endswith(","):
                 return content
     return DEFAULT_REF_TEXT if audio_path.name == DEFAULT_VOICE_NAME else ""
 
@@ -779,14 +777,15 @@ def generate_cloned_voice(
         yield gr.update(), "", f"샘플 파일 없음: {audio_path}", get_saved_files_table(str(out_dir))
         return
 
-    if ref_text and ref_text.strip():
+    clean_ref = (ref_text or "").strip()
+    if not clean_ref or clean_ref.endswith(","):
+        clean_ref = auto_recognize_text(audio_path)
+    else:
         for d in [G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR]:
             try:
-                (d / f"{audio_path.stem}.txt").write_text(ref_text.strip(), encoding="utf-8")
+                (d / f"{audio_path.stem}.txt").write_text(clean_ref, encoding="utf-8")
             except Exception:
                 pass
-    else:
-        ref_text = auto_recognize_text(audio_path)
 
     trimmed_path = prepare_10s_wav(audio_path)
     target_clean = target_text.strip()
@@ -819,13 +818,12 @@ def generate_cloned_voice(
 
                 yield gr.update(), "", f"코랩 T4 GPU에서 고속 생성 중... ({active_colab_url})", get_saved_files_table(str(out_dir))
                 c_colab = get_colab_client(active_colab_url)
-                # 기본 내장 목소리는 코랩 서버에 이미 존재하므로 매번 900KB 업로드 생략 (4초 단축)
                 upload_arg = None if voice_name == DEFAULT_VOICE_NAME else handle_file(str(trimmed_path))
                 try:
                     res = c_colab.predict(
                         voice_name,
                         upload_arg,
-                        ref_text or "",
+                        clean_ref,
                         target_clean,
                         float(temp_val),
                         0.7,
@@ -836,7 +834,7 @@ def generate_cloned_voice(
                     res = c_colab.predict(
                         unicodedata.normalize("NFD", voice_name),
                         handle_file(str(trimmed_path)),
-                        ref_text or "",
+                        clean_ref,
                         target_clean,
                         float(temp_val),
                         0.7,
@@ -859,11 +857,12 @@ def generate_cloned_voice(
 
                 engine = get_local_fish_engine()
                 ref_bytes = get_reference_wav_bytes(trimmed_path)
+                dynamic_max_tokens = min(512, max(96, int(len(target_clean) * 6.5) + 48))
 
                 req = ServeTTSRequest(
                     text=target_clean,
-                    references=[ServeReferenceAudio(audio=ref_bytes, text=(ref_text or "").strip())],
-                    max_new_tokens=1024,
+                    references=[ServeReferenceAudio(audio=ref_bytes, text=clean_ref)],
+                    max_new_tokens=dynamic_max_tokens,
                     chunk_length=200,
                     top_p=0.7,
                     repetition_penalty=1.2,

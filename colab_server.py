@@ -22,7 +22,7 @@ SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_VOICE_NAME = "recording-2026.-10.-16.-오후-1-19-43.wav"
-DEFAULT_REF_TEXT = "아컨텐츠 제작을 위해서 더빙을 해야는데 어떻게 진행을 해야 되는지 고민이시군요 고객님 그러실 때는 타입캐스트를 사용해 보시는 걸 추천드리는데요 다양한 에이아의 캐릭터들과 자연스러운,"
+DEFAULT_REF_TEXT = "아 컨텐츠 제작을 위해서 더빙을 해야 되는데 어떻게 진행을 해야 되는지 고민이시군요 고객님."
 
 
 def download_url_to_file(url: str, dst: Path, min_size: int = 100) -> bool:
@@ -53,7 +53,8 @@ def download_url_to_file(url: str, dst: Path, min_size: int = 100) -> bool:
 def ensure_default_sample():
     target_wav = SAMPLE_DIR / DEFAULT_VOICE_NAME
     target_txt = SAMPLE_DIR / "recording-2026.-10.-16.-오후-1-19-43.txt"
-    if not target_wav.exists() or target_wav.stat().st_size < 1000:
+    # 기존 15초 미완성 문장 샘플(>700KB)이 있으면 6.8초 완결 문장 샘플(~600KB)로 자동 교체
+    if not target_wav.exists() or target_wav.stat().st_size < 1000 or target_wav.stat().st_size > 700000:
         for b64_url in [
             "https://raw.githubusercontent.com/jinPP00/tts_studio/main/sample_voice.b64",
             "https://gist.githubusercontent.com/jinPP00/7990cb24cd047b3f2622296b7d2ed4fa/raw/sample_voice.b64",
@@ -176,9 +177,10 @@ if _vq_inf.exists():
 from omegaconf import OmegaConf
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
-for _mod_name in list(sys.modules.keys()):
-    if _mod_name.startswith("fish_speech"):
-        del sys.modules[_mod_name]
+if "tts_engine" not in globals():
+    for _mod_name in list(sys.modules.keys()):
+        if _mod_name.startswith("fish_speech"):
+            del sys.modules[_mod_name]
 
 import numpy as np
 import torch
@@ -206,20 +208,13 @@ ref_mod.ReferenceLoader.load_audio = _safe_load_audio
 
 
 def apply_fish_speed_patch():
+    """CUDA GPU-CPU 동기화 병목(cudaStreamSynchronize) 완전 제거 및 Top-K 고속 샘플링 패치"""
     try:
         from torch import Tensor
         from typing import Optional, Tuple
         import torch.nn.functional as F
         import fish_speech.models.text2semantic.llama as llama_mod
         import fish_speech.models.text2semantic.inference as inf_mod
-
-        def _fast_kv_update(self, input_pos: Tensor, k_val: Tensor, v_val: Tensor):
-            self.k_cache[:, :, input_pos] = k_val
-            self.v_cache[:, :, input_pos] = v_val
-            end_pos = int(input_pos[-1]) + 1
-            return self.k_cache[:, :, :end_pos], self.v_cache[:, :, :end_pos]
-
-        llama_mod.KVCache.update = _fast_kv_update
 
         def _fast_embed(self, inp: Tensor, share_codebook_embeddings=True) -> Tensor:
             if not hasattr(self, "_sem_min"):
@@ -238,46 +233,45 @@ def apply_fish_speed_patch():
 
         llama_mod.BaseTransformer.embed = _fast_embed
 
-        def _fast_forward_generate(
-            self,
-            inp: Tensor,
-            input_pos: Optional[Tensor] = None,
-            return_all: bool = False,
-        ):
-            x = self.embed(inp, share_codebook_embeddings=self.config.share_codebook_embeddings)
-            if input_pos is None:
-                input_pos = torch.arange(inp.shape[-1], device=x.device)
-                max_seq_len = inp.shape[-1]
-            else:
-                max_seq_len = int(input_pos[-1]) + 1
-            mask = self.causal_mask[None, None, input_pos, :max_seq_len]
-            freqs_cis = self.freqs_cis[input_pos]
-            for layer in self.layers:
-                x = layer(x, freqs_cis, mask, input_pos=input_pos)
-            if x.size(1) > 1 and not return_all:
-                x = x[:, -1:]
-            slow_out = self.norm(x)
-            if self.config.is_reward_model:
-                token_logits = self.score_output(slow_out)
-            elif self.config.tie_word_embeddings:
-                token_logits = F.linear(slow_out, self.embeddings.weight)
-            else:
-                token_logits = self.output(slow_out)
-            return llama_mod.BaseTransformerForwardResult(logits=token_logits, hidden_states=x)
+        # CPU일 때만 KV-Cache 슬라이싱 적용 (CUDA에서는 int(input_pos[-1]) 호출 시 PCIe 동기화 병목이 발생하므로 원형 유지)
+        if not torch.cuda.is_available():
+            def _fast_kv_update_cpu(self, input_pos: Tensor, k_val: Tensor, v_val: Tensor):
+                self.k_cache[:, :, input_pos] = k_val
+                self.v_cache[:, :, input_pos] = v_val
+                end_pos = int(input_pos[-1]) + 1
+                return self.k_cache[:, :, :end_pos], self.v_cache[:, :, :end_pos]
 
-        llama_mod.BaseTransformer.forward_generate = _fast_forward_generate
+            llama_mod.KVCache.update = _fast_kv_update_cpu
 
-        def _fast_forward_generate_fast(self, x: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
-            x = x.view(1, 1, -1)
-            end_pos = int(input_pos[-1]) + 1
-            fast_mask = self.causal_mask[None, None, input_pos, :end_pos]
-            fast_freqs_cis = self.fast_freqs_cis[input_pos]
-            for layer in self.fast_layers:
-                x = layer(x, fast_freqs_cis, fast_mask, input_pos=input_pos)
-            fast_out = self.fast_norm(x)
-            return self.fast_output(fast_out)
+            def _fast_forward_generate_cpu(self, inp: Tensor, input_pos: Optional[Tensor] = None, return_all: bool = False):
+                x = self.embed(inp, share_codebook_embeddings=self.config.share_codebook_embeddings)
+                if input_pos is None:
+                    input_pos = torch.arange(inp.shape[-1], device=x.device)
+                    max_seq_len = inp.shape[-1]
+                else:
+                    max_seq_len = int(input_pos[-1]) + 1
+                mask = self.causal_mask[None, None, input_pos, :max_seq_len]
+                freqs_cis = self.freqs_cis[input_pos]
+                for layer in self.layers:
+                    x = layer(x, freqs_cis, mask, input_pos=input_pos)
+                if x.size(1) > 1 and not return_all:
+                    x = x[:, -1:]
+                slow_out = self.norm(x)
+                token_logits = F.linear(slow_out, self.embeddings.weight) if self.config.tie_word_embeddings else self.output(slow_out)
+                return llama_mod.BaseTransformerForwardResult(logits=token_logits, hidden_states=x)
 
-        llama_mod.DualARTransformer.forward_generate_fast = _fast_forward_generate_fast
+            llama_mod.BaseTransformer.forward_generate = _fast_forward_generate_cpu
+
+            def _fast_forward_generate_fast_cpu(self, x: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+                x = x.view(1, 1, -1)
+                end_pos = int(input_pos[-1]) + 1
+                fast_mask = self.causal_mask[None, None, input_pos, :end_pos]
+                fast_freqs_cis = self.fast_freqs_cis[input_pos]
+                for layer in self.fast_layers:
+                    x = layer(x, fast_freqs_cis, fast_mask, input_pos=input_pos)
+                return self.fast_output(self.fast_norm(x))
+
+            llama_mod.DualARTransformer.forward_generate_fast = _fast_forward_generate_fast_cpu
 
         def _fast_sample(
             logits,
@@ -293,13 +287,14 @@ def apply_fish_speed_patch():
                     score = torch.where(score < 0, score * rep_pen, score / rep_pen)
                     logit_1d.scatter_(dim=0, index=previous_tokens, src=score)
                 top_vals, top_idx = torch.topk(logit_1d, 256, dim=-1)
-                temp_val = max(float(sampling_kwargs.get("temperature", 0.7)), 1e-5)
+                sorted_probs = torch.nn.functional.softmax(top_vals, dim=-1)
+                cum_probs = torch.cumsum(sorted_probs, dim=-1)
                 top_p_val = sampling_kwargs.get("top_p", 0.7)
-                probs_top = torch.nn.functional.softmax(top_vals / temp_val, dim=-1)
-                cum_probs = torch.cumsum(probs_top, dim=-1)
                 remove_mask = cum_probs > top_p_val
                 remove_mask[0] = False
-                probs_top = probs_top.masked_fill(remove_mask, 0.0)
+                top_vals = top_vals.masked_fill(remove_mask, -float("Inf"))
+                temp_val = sampling_kwargs.get("temperature", 0.7)
+                probs_top = torch.nn.functional.softmax(top_vals / temp_val, dim=-1)
                 q = torch.empty_like(probs_top).exponential_(1)
                 local_idx = torch.argmax(probs_top / q, dim=-1, keepdim=True)
                 idx_next = top_idx.gather(0, local_idx).to(dtype=torch.int)
@@ -349,9 +344,9 @@ _COLAB_REF_CACHE = {}
 def get_colab_ref_bytes(audio_path: Path) -> bytes:
     key = f"{audio_path.resolve()}_{audio_path.stat().st_mtime_ns}"
     if key not in _COLAB_REF_CACHE:
-        wav_10s, sr_10s = librosa.load(str(audio_path), sr=44100, mono=True, duration=10.5)
+        wav_ref, sr_ref = librosa.load(str(audio_path), sr=44100, mono=True, duration=6.8)
         buf = io.BytesIO()
-        sf.write(buf, wav_10s, sr_10s, format="WAV")
+        sf.write(buf, wav_ref, sr_ref, format="WAV", subtype="PCM_16")
         _COLAB_REF_CACHE[key] = buf.getvalue()
     return _COLAB_REF_CACHE[key]
 
@@ -360,10 +355,7 @@ try:
     _def_p = SAMPLE_DIR / DEFAULT_VOICE_NAME
     if _def_p.exists():
         _b = get_colab_ref_bytes(_def_p)
-        from hashlib import sha256
-        _h = sha256(_b).hexdigest()
-        if _h not in tts_engine.ref_by_hash:
-            tts_engine.ref_by_hash[_h] = (tts_engine.encode_reference(_b), DEFAULT_REF_TEXT)
+        tts_engine.load_by_hash([ServeReferenceAudio(audio=_b, text=DEFAULT_REF_TEXT)], "on")
 except Exception:
     pass
 
@@ -376,18 +368,22 @@ _CURRENT_SHARE_URL = ""
 
 
 def render_audio_html(file_path, label="오디오 재생", autoplay=False):
+    """코랩 iframe 프록시 병목을 막기 위해 단일 Base64 + 24kHz 경량 미리듣기 적용"""
     if not file_path or not os.path.exists(str(file_path)):
         return f"<div style='padding:10px; border:1px solid #d1d5db; border-radius:6px; color:#6b7280; font-size:13px;'>[{label}] 대본을 입력하고 '음성 생성' 버튼을 누르면 여기에 재생 바가 나타납니다.</div>"
     try:
         p = Path(file_path)
-        b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+        wav_24k, _ = librosa.load(str(p), sr=24000, mono=True)
+        buf = io.BytesIO()
+        sf.write(buf, wav_24k, 24000, format="WAV", subtype="PCM_16")
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
         auto_attr = "autoplay" if autoplay else ""
         uid = f"aud_{int(time.time()*1000)}"
         return f"""
         <div style="padding:10px 12px; border:1px solid #d1d5db; border-radius:6px; background:#ffffff;">
             <div style="display:flex; justify-content:space-between; margin-bottom:6px; font-size:13px; color:#374151;">
                 <span style="font-weight:600;">{label} — {p.name}</span>
-                <a href="data:audio/wav;base64,{b64}" download="{p.name}" style="color:#111827; text-decoration:underline; font-size:12px;">다운로드</a>
+                <a href="#" onclick="const a=document.createElement('a');a.href=document.getElementById('{uid}').src;a.download='{p.name}';a.click();return false;" style="color:#111827; text-decoration:underline; font-size:12px;">다운로드</a>
             </div>
             <audio id="{uid}" controls {auto_attr} preload="auto" style="width:100%; height:40px; display:block;" src="data:audio/wav;base64,{b64}"></audio>
         </div>
@@ -407,7 +403,9 @@ def load_saved_ref_text(voice_name):
         return DEFAULT_REF_TEXT
     txt_path = SAMPLE_DIR / (Path(voice_name).stem + ".txt")
     if txt_path.exists():
-        return txt_path.read_text(encoding="utf-8").strip()
+        txt = txt_path.read_text(encoding="utf-8").strip()
+        if txt and not txt.endswith(","):
+            return txt
     return DEFAULT_REF_TEXT
 
 
@@ -474,18 +472,19 @@ def generate_tts(voice_name, uploaded_file, ref_text, target_text, temp, top_p, 
             cands = list(SAMPLE_DIR.glob("*.wav"))
             audio_path = cands[0] if cands else audio_path
         v_label = Path(voice_name).stem
-        if ref_text and ref_text.strip():
-            try:
-                (SAMPLE_DIR / f"{v_label}.txt").write_text(ref_text.strip(), encoding="utf-8")
-            except Exception:
-                pass
+
+    clean_ref = (ref_text or "").strip()
+    if not clean_ref or clean_ref.endswith(","):
+        clean_ref = DEFAULT_REF_TEXT
 
     audio_bytes = get_colab_ref_bytes(audio_path)
+    target_clean = target_text.strip()
+    dynamic_max_tokens = min(512, max(96, int(len(target_clean) * 6.5) + 48))
 
     req = ServeTTSRequest(
-        text=target_text.strip(),
-        references=[ServeReferenceAudio(audio=audio_bytes, text=(ref_text or "").strip())],
-        max_new_tokens=1024,
+        text=target_clean,
+        references=[ServeReferenceAudio(audio=audio_bytes, text=clean_ref)],
+        max_new_tokens=dynamic_max_tokens,
         chunk_length=200,
         top_p=float(top_p),
         repetition_penalty=float(rep_penalty),
@@ -500,11 +499,11 @@ def generate_tts(voice_name, uploaded_file, ref_text, target_text, temp, top_p, 
         if result.code == "final":
             sr, wav_data = result.audio
             now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            clean_preview = re.sub(r"[^가-힣a-zA-Z0-9]", "", target_text.strip())[:14] or "tts"
+            clean_preview = re.sub(r"[^가-힣a-zA-Z0-9]", "", target_clean)[:14] or "tts"
             v_slug = re.sub(r"[^가-힣a-zA-Z0-9_-]", "", v_label)[:20] or "voice"
             out_filename = f"{now_str}_{v_slug}_{clean_preview}.wav"
             out_path = OUTPUT_DIR / out_filename
-            sf.write(str(out_path), wav_data, sr)
+            sf.write(str(out_path), wav_data, sr, subtype="PCM_16")
             wav_int16 = (np.clip(wav_data, -1.0, 1.0) * 32767).astype(np.int16)
             return (sr, wav_int16), f"✅ 완료 ({time.time()-t0:.1f}초): {out_filename}", render_audio_html(out_path, "생성 결과", autoplay=True)
         elif result.code == "error":
