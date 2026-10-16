@@ -93,10 +93,11 @@ def unlock_windows_foreground():
 
 
 def pop_explorer_foreground(folder_path: Path, select_file: Path = None):
-    """윈도우 탐색기를 브라우저 맨 앞으로 즉시 팝업 (최신 파일이 있으면 자동 선택)"""
+    """윈도우 탐색기를 브라우저 맨 앞으로 즉시 팝업 (이미 열린 창이나 백그라운드 창도 무조건 최상단 활성화)"""
     folder_path.mkdir(parents=True, exist_ok=True)
     unlock_windows_foreground()
     if sys.platform == "win32":
+        norm_dir = os.path.normpath(str(folder_path.resolve()))
         if select_file is None:
             wavs = sorted(
                 [f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTS],
@@ -105,12 +106,40 @@ def pop_explorer_foreground(folder_path: Path, select_file: Path = None):
             )
             if wavs:
                 select_file = wavs[0]
-        if select_file and select_file.exists():
-            norm_file = os.path.normpath(str(select_file.resolve()))
-            subprocess.Popen(["explorer.exe", f"/select,{norm_file}"])
-        else:
-            norm_dir = os.path.normpath(str(folder_path.resolve()))
-            subprocess.Popen(["explorer.exe", norm_dir])
+
+        arg_str = f"/select,\"{os.path.normpath(str(select_file.resolve()))}\"" if (select_file and select_file.exists()) else f"\"{norm_dir}\""
+        folder_name = folder_path.name
+
+        ps_cmd = f"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinFg {{
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
+}}
+"@
+[WinFg]::keybd_event(0x12, 0, 2, 0)
+Start-Process explorer.exe -ArgumentList '{arg_str}'
+Start-Sleep -Milliseconds 350
+$ws = New-Object -ComObject WScript.Shell
+$null = $ws.AppActivate('{folder_name}')
+$shell = New-Object -ComObject Shell.Application
+foreach ($w in $shell.Windows()) {{
+    try {{
+        if ($w.LocationURL -match [uri]::EscapeDataString('{folder_name}') -or $w.LocationName -eq '{folder_name}') {{
+            $hwnd = [IntPtr]$w.HWND
+            [WinFg]::ShowWindow($hwnd, 9)
+            [WinFg]::SetForegroundWindow($hwnd)
+        }}
+    }} catch {{}}
+}}
+"""
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
     else:
         os.startfile(str(folder_path))
 
@@ -249,11 +278,25 @@ def get_colab_client(url: str) -> Client:
     return _COLAB_CLIENT_CACHE[url]
 
 
+def render_status_badge(text: str, is_online: bool = True) -> str:
+    dot_color = "#10B981" if is_online else "#52525B"
+    bg_color = "#ECFDF5" if is_online else "#F4F4F5"
+    border_color = "rgba(16, 185, 129, 0.25)" if is_online else "rgba(15, 23, 42, 0.08)"
+    text_color = "#065F46" if is_online else "#27272A"
+    return f"""
+    <div style="display:flex;align-items:center;justify-content:center;gap:8px;background:{bg_color};border:1px solid {border_color};border-radius:999px;padding:8px 16px;font-size:13px;font-weight:600;color:{text_color};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+        <span style="width:8px;height:8px;border-radius:50%;background:{dot_color};flex-shrink:0;display:inline-block;"></span>
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{text}</span>
+    </div>
+    """
+
+
 def get_status_label(force_refresh: bool = False) -> str:
     url = get_colab_url(force_refresh=force_refresh)
     if url:
-        return f"● 코랩 T4 GPU 가속 연결됨 ({url})"
-    return "● 내 PC 단독 엔진 준비 완료 (코랩 없이 바로 생성 가능)"
+        short_host = url.replace("https://", "").replace("http://", "").split("/")[0]
+        return render_status_badge(f"코랩 T4 GPU 가속 연결됨 · {short_host}", is_online=True)
+    return render_status_badge("내 PC 단독 엔진 준비 완료 (코랩 없이 바로 생성)", is_online=False)
 
 
 def apply_fish_speed_patch():
@@ -977,7 +1020,8 @@ def _send_colab_autorun_keys():
 def auto_start_colab_from_pc():
     already_url = get_colab_url(force_refresh=True)
     if already_url:
-        yield f"● 코랩 T4 GPU 가속 연결됨 ({already_url})", "이미 코랩 GPU가 연결되어 있습니다. 바로 음성 생성을 진행하세요."
+        short_host = already_url.replace("https://", "").replace("http://", "").split("/")[0]
+        yield render_status_badge(f"코랩 T4 GPU 가속 연결됨 · {short_host}", is_online=True), "이미 코랩 GPU가 연결되어 있습니다. 바로 음성 생성을 진행하세요."
         return
 
     unlock_windows_foreground()
@@ -988,15 +1032,16 @@ def auto_start_colab_from_pc():
         webbrowser.open(COLAB_DIRECT_URL)
 
     threading.Thread(target=_send_colab_autorun_keys, daemon=True).start()
-    yield "○ 코랩 GPU 자동 시동 중...", "코랩 노트북을 열고 자동 실행(Ctrl+F9) 신호를 보냈습니다. 대기 중에도 내 PC 엔진으로 즉시 생성이 가능합니다."
+    yield render_status_badge("코랩 GPU 자동 시동 중...", is_online=False), "코랩 노트북을 열고 자동 실행(Ctrl+F9) 신호를 보냈습니다. 대기 중에도 내 PC 엔진으로 즉시 생성이 가능합니다."
 
     for sec in range(4, 95, 4):
         time.sleep(4.0)
         url = get_colab_url(force_refresh=True)
         if url:
-            yield f"● 코랩 T4 GPU 가속 연결됨 ({url})", f"코랩 T4 GPU 연결이 완료되었습니다 ({url})"
+            short_host = url.replace("https://", "").replace("http://", "").split("/")[0]
+            yield render_status_badge(f"코랩 T4 GPU 가속 연결됨 · {short_host}", is_online=True), f"코랩 T4 GPU 연결이 완료되었습니다 ({url})"
             return
-        yield f"○ 코랩 GPU 시동 대기 중 ({sec}초)...", f"코랩 서버 준비 중 ({sec}초 경과) · 기다리지 않고 지금 바로 음성 생성을 누르셔도 작동합니다."
+        yield render_status_badge(f"코랩 GPU 시동 대기 중 ({sec}초)...", is_online=False), f"코랩 서버 준비 중 ({sec}초 경과) · 기다리지 않고 지금 바로 음성 생성을 누르셔도 작동합니다."
 
     yield get_status_label(force_refresh=True), "내 PC 단독 모드로 언제든 생성 가능합니다."
 
@@ -1004,7 +1049,7 @@ def auto_start_colab_from_pc():
 def shutdown_remote_colab(colab_url_input: str):
     url = get_colab_url(colab_url_input, force_refresh=True)
     if not url:
-        return "● 내 PC 단독 엔진 준비 완료 (코랩 없이 바로 생성 가능)", "현재 연결된 코랩 세션이 없습니다."
+        return render_status_badge("내 PC 단독 엔진 준비 완료 (코랩 없이 바로 생성)", is_online=False), "현재 연결된 코랩 세션이 없습니다."
     try:
         c = get_colab_client(url)
         c.predict(api_name="/shutdown_colab")
@@ -1020,63 +1065,190 @@ def shutdown_remote_colab(colab_url_input: str):
     save_settings({"colab_url": ""})
     _LAST_COLAB_CHECK["url"] = ""
     _LAST_COLAB_CHECK["ts"] = time.time()
-    return "● 내 PC 단독 엔진 준비 완료 (코랩 없이 바로 생성 가능)", "코랩 GPU 세션을 안전하게 반납(종료)했습니다."
+    return render_status_badge("내 PC 단독 엔진 준비 완료 (코랩 없이 바로 생성)", is_online=False), "코랩 GPU 세션을 안전하게 반납(종료)했습니다."
 
+
+FORCE_LIGHT_JS = """
+() => {
+    document.documentElement.classList.remove('dark');
+    if (document.body) {
+        document.body.classList.remove('dark');
+        document.body.style.colorScheme = 'light';
+    }
+    document.documentElement.style.colorScheme = 'light';
+}
+"""
 
 STUDIO_CSS = """
 @import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable.min.css");
 
-:root, .light, .dark {
-    --body-background-fill: #F5F5F3 !important;
+:root, .light, .dark, body, .gradio-container {
+    color-scheme: light !important;
+    --neutral-50: #FAFAFA !important;
+    --neutral-100: #F4F4F5 !important;
+    --neutral-200: #E4E4E7 !important;
+    --neutral-300: #D4D4D8 !important;
+    --neutral-400: #A1A1AA !important;
+    --neutral-500: #71717A !important;
+    --neutral-600: #52525B !important;
+    --neutral-700: #3F3F46 !important;
+    --neutral-800: #27272A !important;
+    --neutral-900: #18181B !important;
+    --neutral-950: #09090B !important;
+
+    --body-background-fill: #F4F4F1 !important;
     --background-fill-primary: #FFFFFF !important;
-    --background-fill-secondary: #F9F9F8 !important;
-    --border-color-primary: rgba(15, 23, 42, 0.08) !important;
+    --background-fill-secondary: #F8F8F7 !important;
+    --border-color-primary: #E4E4E7 !important;
     --border-color-accent: #18181B !important;
     --body-text-color: #18181B !important;
-    --body-text-color-subdued: #71717A !important;
+    --body-text-color-subdued: #52525B !important;
+
     --block-background-fill: #FFFFFF !important;
-    --block-border-color: rgba(15, 23, 42, 0.07) !important;
-    --block-label-text-color: #3F3F46 !important;
+    --block-border-color: #E4E4E7 !important;
+    --block-label-text-color: #18181B !important;
+    --block-label-background-fill: #F4F4F5 !important;
+    --block-title-text-color: #18181B !important;
+    --block-info-text-color: #52525B !important;
+
     --input-background-fill: #F8F8F7 !important;
-    --input-border-color: rgba(15, 23, 42, 0.09) !important;
+    --input-background-fill-focus: #FFFFFF !important;
+    --input-border-color: #D4D4D8 !important;
+    --input-border-color-focus: #18181B !important;
+    --input-text-color: #18181B !important;
+    --input-placeholder-color: #71717A !important;
+
+    --checkbox-background-color: #FFFFFF !important;
+    --checkbox-background-color-selected: #18181B !important;
+    --checkbox-border-color: #A1A1AA !important;
+    --checkbox-label-background-fill: #F4F4F5 !important;
+    --checkbox-label-background-fill-hover: #E4E4E7 !important;
+    --checkbox-label-background-fill-selected: #18181B !important;
+    --checkbox-label-text-color: #18181B !important;
+    --checkbox-label-text-color-selected: #FFFFFF !important;
+
+    --table-even-background-fill: #FAFAFA !important;
+    --table-odd-background-fill: #FFFFFF !important;
+    --table-row-focus: #F4F4F5 !important;
+    --table-border-color: #E4E4E7 !important;
+    --table-text-color: #18181B !important;
+    --panel-background-fill: #FFFFFF !important;
+
     --button-primary-background-fill: #18181B !important;
     --button-primary-background-fill-hover: #27272A !important;
     --button-primary-text-color: #FFFFFF !important;
     --button-secondary-background-fill: #F4F4F5 !important;
     --button-secondary-background-fill-hover: #E4E4E7 !important;
-    --button-secondary-text-color: #27272A !important;
+    --button-secondary-text-color: #18181B !important;
 }
 
 body, .gradio-container {
-    background-color: #F5F5F3 !important;
+    background-color: #F4F4F1 !important;
     color: #18181B !important;
     font-family: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
     letter-spacing: -0.015em !important;
 }
 
 .gradio-container {
-    max-width: 1180px !important;
+    max-width: 1200px !important;
     margin: 0 auto !important;
-    padding: 28px 24px 48px 24px !important;
+    padding: 24px 24px 48px 24px !important;
 }
 
 footer { display: none !important; }
 
+/* 모든 블록 라벨, 타이틀, 스팬, 입력 텍스트 가독성 강제 보장 (흰배경 흰글자 원천 차단) */
+label, .block label, [data-testid="block-info"], .label-wrap, .label-wrap span {
+    color: #18181B !important;
+    font-weight: 600 !important;
+    font-size: 13.5px !important;
+    white-space: nowrap !important;
+}
+
+input, textarea, select, .single-select, .wrap-inner, .secondary-wrap {
+    color: #18181B !important;
+    background-color: #F8F8F7 !important;
+}
+
+/* 드롭다운 메뉴 및 선택값 글자색 강제 지정 */
+ul.options, ul.options li, .item {
+    background-color: #FFFFFF !important;
+    color: #18181B !important;
+}
+ul.options li:hover, ul.options li.selected {
+    background-color: #F4F4F5 !important;
+    color: #18181B !important;
+    font-weight: 600 !important;
+}
+
+/* 라디오 버튼 및 체크박스 줄바꿈 방지 및 선택 시 대비 강화 */
+.wrap {
+    gap: 8px !important;
+}
+label.svelte-1p9xokt, .gradio-radio label, .gradio-checkbox label {
+    background: #F4F4F5 !important;
+    color: #18181B !important;
+    border: 1px solid #D4D4D8 !important;
+    border-radius: 8px !important;
+    padding: 6px 12px !important;
+    font-weight: 600 !important;
+    font-size: 13px !important;
+    white-space: nowrap !important;
+    word-break: keep-all !important;
+}
+.gradio-radio label.selected, .gradio-radio label:has(input:checked) {
+    background: #18181B !important;
+    color: #FFFFFF !important;
+    border-color: #18181B !important;
+}
+.gradio-radio label.selected span, .gradio-radio label:has(input:checked) span {
+    color: #FFFFFF !important;
+}
+
+/* 데이터프레임 / 테이블 검은배경에 검은글자 문제 완전 해결 */
+table, thead, tbody, tr, th, td,
+.table-wrap, .svelte-1b7421c, [data-testid="dataframe"], [data-testid="dataframe"] * {
+    background-color: #FFFFFF !important;
+    color: #18181B !important;
+    border-color: #E4E4E7 !important;
+    font-size: 13px !important;
+}
+thead th, thead tr th, .header-row th {
+    background-color: #F4F4F5 !important;
+    color: #18181B !important;
+    font-weight: 700 !important;
+    border-bottom: 1px solid #D4D4D8 !important;
+}
+tbody tr:nth-child(even) td {
+    background-color: #FAFAFA !important;
+    color: #18181B !important;
+}
+tbody tr:hover td {
+    background-color: #EEF2FF !important;
+    color: #18181B !important;
+    cursor: pointer !important;
+}
+.cell-wrap, .cell-wrap span, td span, th span {
+    color: #18181B !important;
+    background: transparent !important;
+}
+
 /* 상단 헤더 바 */
 .studio-topbar {
     background: #FFFFFF !important;
-    border: 1px solid rgba(15, 23, 42, 0.07) !important;
+    border: 1px solid #E4E4E7 !important;
     border-radius: 16px !important;
-    padding: 14px 20px !important;
+    padding: 12px 20px !important;
     margin-bottom: 20px !important;
-    box-shadow: 0 2px 10px rgba(15, 23, 42, 0.025) !important;
+    box-shadow: 0 2px 10px rgba(15, 23, 42, 0.03) !important;
     align-items: center !important;
 }
 
 .brand-header {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
+    white-space: nowrap;
 }
 .brand-dot {
     width: 10px;
@@ -1084,42 +1256,30 @@ footer { display: none !important; }
     border-radius: 50%;
     background: #18181B;
     box-shadow: 0 0 0 4px rgba(24, 24, 27, 0.08);
+    flex-shrink: 0;
 }
 .brand-title {
     font-size: 17px;
     font-weight: 700;
-    color: #18181B;
+    color: #18181B !important;
     letter-spacing: -0.025em;
     margin: 0;
 }
 .brand-sub {
     font-size: 12px;
-    color: #71717A;
-    font-weight: 500;
-    margin-left: 4px;
-}
-
-/* 상단 상태 배지 입력창 */
-.status-pill-input textarea, .status-pill-input input {
-    background: #F4F4F5 !important;
-    border: 1px solid rgba(15, 23, 42, 0.06) !important;
-    border-radius: 999px !important;
-    padding: 7px 14px !important;
-    font-size: 12.5px !important;
-    font-weight: 600 !important;
-    color: #27272A !important;
-    text-align: center !important;
-    box-shadow: none !important;
+    color: #52525B !important;
+    font-weight: 600;
+    margin-left: 6px;
 }
 
 /* 좌우 메인 카드 패널 */
 .studio-card {
     background: #FFFFFF !important;
-    border: 1px solid rgba(15, 23, 42, 0.07) !important;
+    border: 1px solid #E4E4E7 !important;
     border-radius: 18px !important;
     padding: 24px !important;
-    box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.035) !important;
-    gap: 16px !important;
+    box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.04) !important;
+    gap: 14px !important;
 }
 
 .section-heading {
@@ -1127,29 +1287,29 @@ footer { display: none !important; }
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: #71717A;
-    margin: 0 0 4px 0;
+    color: #52525B !important;
+    margin: 0 0 2px 0;
     display: flex;
     align-items: center;
     justify-content: space-between;
+    white-space: nowrap;
+}
+.section-heading span {
+    color: #52525B !important;
 }
 
 .section-divider {
     height: 1px;
-    background: rgba(15, 23, 42, 0.06);
-    margin: 10px 0;
+    background: #E4E4E7;
+    margin: 8px 0;
 }
 
 /* 커스텀 오디오 플레이어 카드 */
 .audio-player-card {
-    background: #F9F9F8;
-    border: 1px solid rgba(15, 23, 42, 0.08);
+    background: #F8F8F7;
+    border: 1px solid #E4E4E7;
     border-radius: 14px;
     padding: 14px 16px;
-    transition: all 0.15s ease;
-}
-.audio-player-card:hover {
-    border-color: rgba(15, 23, 42, 0.15);
 }
 .audio-card-header {
     display: flex;
@@ -1166,8 +1326,8 @@ footer { display: none !important; }
     flex: 1;
 }
 .audio-badge {
-    background: #18181B;
-    color: #FFFFFF;
+    background: #18181B !important;
+    color: #FFFFFF !important;
     font-size: 11px;
     font-weight: 600;
     padding: 3px 8px;
@@ -1177,7 +1337,7 @@ footer { display: none !important; }
 .audio-filename {
     font-size: 13px;
     font-weight: 600;
-    color: #27272A;
+    color: #18181B !important;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1190,22 +1350,21 @@ footer { display: none !important; }
 }
 .audio-size {
     font-size: 11.5px;
-    color: #71717A;
-    font-weight: 500;
+    color: #52525B !important;
+    font-weight: 600;
 }
 .audio-dl-btn {
-    background: #FFFFFF;
-    border: 1px solid rgba(15, 23, 42, 0.12);
+    background: #FFFFFF !important;
+    border: 1px solid #D4D4D8 !important;
     color: #18181B !important;
     text-decoration: none !important;
     font-size: 11.5px;
     font-weight: 600;
     padding: 4px 10px;
     border-radius: 7px;
-    transition: all 0.15s ease;
 }
 .audio-dl-btn:hover {
-    background: #18181B;
+    background: #18181B !important;
     color: #FFFFFF !important;
 }
 .studio-audio-el {
@@ -1220,10 +1379,10 @@ footer { display: none !important; }
     align-items: center;
     gap: 10px;
     padding: 16px 18px;
-    border: 1px dashed rgba(15, 23, 42, 0.14);
+    border: 1px dashed #D4D4D8;
     border-radius: 14px;
     background: #FAFAFA;
-    color: #71717A;
+    color: #52525B !important;
     font-size: 13px;
     font-weight: 500;
 }
@@ -1231,20 +1390,19 @@ footer { display: none !important; }
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: #D4D4D8;
+    background: #A1A1AA;
     flex-shrink: 0;
 }
 
 /* 대본 입력 에디터 */
 .script-editor textarea {
-    background: #F9F9F8 !important;
-    border: 1px solid rgba(15, 23, 42, 0.09) !important;
+    background: #F8F8F7 !important;
+    border: 1px solid #D4D4D8 !important;
     border-radius: 14px !important;
     padding: 16px 18px !important;
     font-size: 15.5px !important;
     line-height: 1.65 !important;
     color: #18181B !important;
-    transition: all 0.18s ease !important;
 }
 .script-editor textarea:focus {
     background: #FFFFFF !important;
@@ -1252,7 +1410,7 @@ footer { display: none !important; }
     box-shadow: 0 0 0 3px rgba(24, 24, 27, 0.06) !important;
 }
 
-/* 버튼 스타일 다듬기 */
+/* 버튼 스타일 */
 button.primary {
     background: #18181B !important;
     color: #FFFFFF !important;
@@ -1261,27 +1419,30 @@ button.primary {
     font-size: 15px !important;
     font-weight: 600 !important;
     min-height: 48px !important;
-    box-shadow: 0 4px 12px rgba(24, 24, 27, 0.14) !important;
-    transition: all 0.15s ease !important;
+    white-space: nowrap !important;
+}
+button.primary * {
+    color: #FFFFFF !important;
 }
 button.primary:hover {
     background: #27272A !important;
-    transform: translateY(-1px);
-    box-shadow: 0 6px 16px rgba(24, 24, 27, 0.18) !important;
 }
 
 button.secondary, button.stop {
     background: #F4F4F5 !important;
-    color: #27272A !important;
-    border: 1px solid rgba(15, 23, 42, 0.07) !important;
+    color: #18181B !important;
+    border: 1px solid #D4D4D8 !important;
     border-radius: 10px !important;
     font-weight: 600 !important;
     font-size: 13px !important;
-    transition: all 0.15s ease !important;
+    white-space: nowrap !important;
+}
+button.secondary *, button.stop * {
+    color: #18181B !important;
 }
 button.secondary:hover, button.stop:hover {
     background: #E4E4E7 !important;
-    color: #18181B !important;
+    color: #09090B !important;
 }
 .main-stop-btn {
     min-height: 48px !important;
@@ -1290,26 +1451,21 @@ button.secondary:hover, button.stop:hover {
 
 /* 상태 알림 바 */
 .status-toast textarea, .status-toast input {
-    background: #F8F8F7 !important;
-    border: 1px solid rgba(15, 23, 42, 0.06) !important;
+    background: #F4F4F5 !important;
+    border: 1px solid #E4E4E7 !important;
     border-radius: 10px !important;
-    padding: 9px 14px !important;
+    padding: 10px 14px !important;
     font-size: 13px !important;
-    font-weight: 500 !important;
-    color: #3F3F46 !important;
+    font-weight: 600 !important;
+    color: #18181B !important;
 }
 
-/* 아코디언 및 테이블 정돈 */
+/* 아코디언 정돈 */
 .gradio-accordion {
-    border: 1px solid rgba(15, 23, 42, 0.07) !important;
+    border: 1px solid #E4E4E7 !important;
     border-radius: 12px !important;
     background: #FAFAFA !important;
     overflow: hidden !important;
-}
-table {
-    border-radius: 12px !important;
-    overflow: hidden !important;
-    font-size: 13px !important;
 }
 """
 
@@ -1328,7 +1484,7 @@ with gr.Blocks(title="Voice Cloning Studio") as demo:
 
     # 상단 스튜디오 헤더 바
     with gr.Row(elem_classes="studio-topbar", equal_height=True):
-        with gr.Column(scale=3, min_width=240):
+        with gr.Column(scale=3, min_width=210):
             gr.HTML(
                 """
                 <div class="brand-header">
@@ -1340,14 +1496,8 @@ with gr.Blocks(title="Voice Cloning Studio") as demo:
                 </div>
                 """
             )
-        colab_status_txt = gr.Textbox(
-            value=get_status_label(),
-            show_label=False,
-            container=False,
-            interactive=False,
-            scale=4,
-            elem_classes="status-pill-input",
-        )
+        with gr.Column(scale=5, min_width=320):
+            colab_status_txt = gr.HTML(value=get_status_label())
         colab_btn = gr.Button("코랩 가속 시동", variant="secondary", size="sm", scale=0)
         colab_kill_btn = gr.Button("GPU 반납", variant="secondary", size="sm", scale=0)
         refresh_btn = gr.Button("새로고침", variant="secondary", size="sm", scale=0)
@@ -1365,8 +1515,7 @@ with gr.Blocks(title="Voice Cloning Studio") as demo:
             )
             sample_audio_html = gr.HTML(value=initial_preview_html)
             with gr.Row():
-                play_sample_ext_btn = gr.Button("외부 플레이어 재생", variant="secondary", size="sm")
-                open_sample_btn = gr.Button("샘플 보관함 열기", variant="secondary", size="sm")
+                open_sample_btn = gr.Button("📂 샘플 보관 폴더 열기", variant="secondary", size="sm")
 
             with gr.Accordion("새 보이스 등록 및 원본 대사 편집", open=False):
                 ref_text_box = gr.Textbox(
@@ -1388,8 +1537,8 @@ with gr.Blocks(title="Voice Cloning Studio") as demo:
             )
             output_dir_box = gr.Textbox(value=str(initial_out_dir), label="현재 저장 경로")
             with gr.Row():
-                browse_folder_btn = gr.Button("폴더 찾아보기...", variant="secondary", size="sm")
-                open_output_btn = gr.Button("저장 폴더 열기", variant="secondary", size="sm")
+                browse_folder_btn = gr.Button("폴더 위치 변경...", variant="secondary", size="sm")
+                open_output_btn = gr.Button("📂 저장 폴더 열기", variant="secondary", size="sm")
 
         # 우측: 스크립트 작성, 합성 컨트롤 & 결과 트랙
         with gr.Column(scale=6, elem_classes="studio-card"):
@@ -1406,10 +1555,19 @@ with gr.Blocks(title="Voice Cloning Studio") as demo:
                 engine_radio = gr.Radio(
                     choices=["코랩 우선 (자동)", "코랩 전용", "내 PC 로컬"],
                     value="코랩 우선 (자동)",
-                    label="합성 엔진",
+                    label="합성 엔진 선택",
                     scale=3,
+                    min_width=320,
                 )
-                speed_slider = gr.Slider(0.8, 1.3, value=1.0, step=0.05, label="말하기 속도 (배속)", scale=2)
+                speed_slider = gr.Slider(
+                    0.8,
+                    1.3,
+                    value=1.0,
+                    step=0.05,
+                    label="말하기 배속",
+                    scale=2,
+                    min_width=190,
+                )
 
             with gr.Accordion("고급 합성 옵션 (파일명 접두어 · 감정 온도 · 무음 정리)", open=False):
                 with gr.Row():
@@ -1436,7 +1594,7 @@ with gr.Blocks(title="Voice Cloning Studio") as demo:
             gr.HTML('<div class="section-heading"><span>04 · 마스터 오디오 & 히스토리</span><span>MASTER TRACK</span></div>')
             output_audio_html = gr.HTML(value=initial_output_html)
             with gr.Row():
-                play_output_ext_btn = gr.Button("윈도우 미디어 플레이어로 열기", variant="secondary", size="sm")
+                open_output_track_btn = gr.Button("📂 방금 생성된 파일 위치 열기", variant="secondary", size="sm")
 
             history_table = gr.Dataframe(
                 headers=["파일명", "용량", "생성 시각", "전체 경로"],
@@ -1452,15 +1610,9 @@ with gr.Blocks(title="Voice Cloning Studio") as demo:
         outputs=[sample_audio_html, ref_text_box, sample_path_state],
         queue=False,
     )
-    play_sample_ext_btn.click(
-        fn=play_external_player,
-        inputs=[sample_path_state],
-        outputs=[status_box],
-        queue=False,
-    )
-    play_output_ext_btn.click(
-        fn=play_external_player,
-        inputs=[output_path_state],
+    open_output_track_btn.click(
+        fn=open_selected_output_folder,
+        inputs=[output_dir_box, output_path_state],
         outputs=[status_box],
         queue=False,
     )
@@ -1543,6 +1695,7 @@ if __name__ == "__main__":
         server_port=7865,
         inbrowser=False,
         css=STUDIO_CSS,
+        js=FORCE_LIGHT_JS,
         theme=gr.themes.Base(),
         allowed_paths=[
             str(DESKTOP_OUT_DIR),
