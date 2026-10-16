@@ -682,7 +682,7 @@ def open_sample_folder():
     return f"샘플 폴더 열기: {G_DRIVE_SAMPLE_DIR}"
 
 
-COLAB_DIRECT_URL = "https://colab.research.google.com/github/jinPP00/tts_studio/blob/main/fish_tts_studio.ipynb"
+COLAB_DIRECT_URL = "https://colab.research.google.com/drive/1UKsxGyCwji6kTzov8D_3rUvJT0CnyQLb"
 
 
 def open_colab_page():
@@ -691,7 +691,7 @@ def open_colab_page():
     except Exception:
         import webbrowser
         webbrowser.open(COLAB_DIRECT_URL)
-    return "코랩 페이지를 열었습니다. ('활성 세션이 너무 많습니다' 창이 뜨면 창 안의 [종료]를 한 번 눌러주세요)"
+    return "내 드라이브 코랩 노트북을 열었습니다. (경고 팝업 없음)"
 
 
 def shutdown_remote_colab(colab_url_input: str):

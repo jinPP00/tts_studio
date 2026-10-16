@@ -1,2 +1,2 @@
 @echo off
-start "" "https://colab.research.google.com/github/jinPP00/tts_studio/blob/main/fish_tts_studio.ipynb"
+start "" "https://colab.research.google.com/drive/1UKsxGyCwji6kTzov8D_3rUvJT0CnyQLb"
