@@ -7,6 +7,9 @@ import time
 import wave
 import base64
 import shutil
+import ctypes
+import threading
+import subprocess
 import unicodedata
 import urllib.request
 from pathlib import Path
@@ -53,14 +56,17 @@ try:
 except Exception:
     pass
 
+DEFAULT_VOICE_NAME = "recording-2026.-10.-16.-오후-1-19-43.wav"
+DEFAULT_REF_TEXT = "아컨텐츠 제작을 위해서 더빙을 해야는데 어떻게 진행을 해야 되는지 고민이시군요 고객님 그러실 때는 타입캐스트를 사용해 보시는 걸 추천드리는데요 다양한 에이아의 캐릭터들과 자연스러운,"
+
 # 다른 PC에서 처음 실행해 샘플 폴더가 비어 있을 경우 내장된 기본 샘플 자동 복원
-_default_wav = LOCAL_SAMPLE_DIR / "recording-2026.-10.-16.-오후-1-19-43.wav"
+_default_wav = LOCAL_SAMPLE_DIR / DEFAULT_VOICE_NAME
 _b64_file = STUDIO_DIR / "sample_voice.b64"
 if not _default_wav.exists() and _b64_file.exists():
     try:
         _default_wav.write_bytes(base64.b64decode(_b64_file.read_bytes()))
         (LOCAL_SAMPLE_DIR / "recording-2026.-10.-16.-오후-1-19-43.txt").write_text(
-            "아컨텐츠 제작을 위해서 더빙을 해야는데 어떻게 진행을 해야 되는지 고민이시군요 고객님 그러실 때는 타입캐스트를 사용해 보시는 걸 추천드리는데요 다양한 에이아의 캐릭터들과 자연스러운,",
+            DEFAULT_REF_TEXT,
             encoding="utf-8",
         )
     except Exception:
@@ -69,7 +75,45 @@ if not _default_wav.exists() and _b64_file.exists():
 NTFY_TOPIC = "jinpp00_fish_tts_colab_2026"
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
 _LOCAL_FISH_ENGINE = None
+_ENGINE_LOCK = threading.Lock()
 _CANCEL_REQUESTED = False
+_COLAB_CLIENT_CACHE = {}
+_LAST_COLAB_CHECK = {"ts": 0.0, "url": ""}
+_REF_BYTES_CACHE = {}
+
+
+def unlock_windows_foreground():
+    """백그라운드 파이썬 프로세스에서 탐색기/창을 띄울 때 브라우저 위로 즉시 올라오도록 포그라운드 잠금 해제"""
+    if sys.platform == "win32":
+        try:
+            user32 = ctypes.windll.user32
+            user32.keybd_event(0x12, 0, 2, 0)  # VK_MENU keyup
+            user32.AllowSetForegroundWindow(-1)
+        except Exception:
+            pass
+
+
+def pop_explorer_foreground(folder_path: Path, select_file: Path = None):
+    """윈도우 탐색기를 브라우저 맨 앞으로 즉시 팝업 (최신 파일이 있으면 자동 선택)"""
+    folder_path.mkdir(parents=True, exist_ok=True)
+    unlock_windows_foreground()
+    if sys.platform == "win32":
+        if select_file is None:
+            wavs = sorted(
+                [f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTS],
+                key=lambda x: x.stat().st_mtime,
+                reverse=True,
+            )
+            if wavs:
+                select_file = wavs[0]
+        if select_file and select_file.exists():
+            norm_file = os.path.normpath(str(select_file.resolve()))
+            subprocess.Popen(["explorer.exe", f"/select,{norm_file}"])
+        else:
+            norm_dir = os.path.normpath(str(folder_path.resolve()))
+            subprocess.Popen(["explorer.exe", norm_dir])
+    else:
+        os.startfile(str(folder_path))
 
 
 def render_audio_html(file_path, label: str = "오디오 미리듣기", autoplay: bool = False) -> str:
@@ -140,20 +184,34 @@ def is_colab_alive(url: str) -> bool:
         return False
     try:
         req = urllib.request.Request(f"{url.strip().rstrip('/')}/config", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=1.5) as r:
+        with urllib.request.urlopen(req, timeout=1.2) as r:
             return r.status == 200
     except Exception:
         return False
 
 
-def get_colab_url(custom_colab_url: str = "") -> str:
+def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> str:
+    # 1. 사용자가 직접 주소를 입력했고 살아있으면 최우선 사용 (죽은 주소면 무시하고 자동 탐색으로 진행)
     if custom_colab_url and custom_colab_url.strip().startswith("http"):
         url = custom_colab_url.strip()
         if is_colab_alive(url):
             save_settings({"colab_url": url})
+            _LAST_COLAB_CHECK["ts"] = time.time()
+            _LAST_COLAB_CHECK["url"] = url
             return url
-        return ""
 
+    now = time.time()
+    if not force_refresh and (now - _LAST_COLAB_CHECK["ts"] < 4.0):
+        return _LAST_COLAB_CHECK["url"]
+
+    # 2. 기존 저장된 코랩 주소가 살아있는지 먼저 빠르게 확인
+    saved = load_settings().get("colab_url", "").strip()
+    if saved and is_colab_alive(saved):
+        _LAST_COLAB_CHECK["ts"] = now
+        _LAST_COLAB_CHECK["url"] = saved
+        return saved
+
+    # 3. ntfy 채널에서 가장 최근의 살아있는 코랩 주소 자동 수신
     try:
         req = urllib.request.Request(
             f"https://ntfy.sh/{NTFY_TOPIC}/json?poll=1&since=all",
@@ -168,26 +226,154 @@ def get_colab_url(custom_colab_url: str = "") -> str:
                 if msg.startswith("https://") and "gradio.live" in msg and "33eb403275e9404ad6" not in msg and "test-colab" not in msg:
                     if is_colab_alive(msg):
                         save_settings({"colab_url": msg})
+                        _LAST_COLAB_CHECK["ts"] = now
+                        _LAST_COLAB_CHECK["url"] = msg
                         return msg
                     break
     except Exception:
         pass
 
-    saved = load_settings().get("colab_url", "").strip()
-    if saved and is_colab_alive(saved):
-        return saved
+    _LAST_COLAB_CHECK["ts"] = now
+    _LAST_COLAB_CHECK["url"] = ""
     return ""
 
 
-def get_status_label() -> str:
-    url = get_colab_url()
+def get_colab_client(url: str) -> Client:
+    url = url.strip().rstrip("/")
+    if url not in _COLAB_CLIENT_CACHE:
+        _COLAB_CLIENT_CACHE[url] = Client(url)
+    return _COLAB_CLIENT_CACHE[url]
+
+
+def get_status_label(force_refresh: bool = False) -> str:
+    url = get_colab_url(force_refresh=force_refresh)
     if url:
         return f"코랩 연결됨 ({url})"
-    return "코랩 오프라인 (내 PC 로컬 대기)"
+    return "코랩 오프라인 (내 PC 로컬 고속 엔진 대기)"
+
+
+def apply_fish_speed_patch():
+    """Fish Speech 1.5 KV-Cache 슬라이싱 및 Top-K 샘플링 고속화 패치 (CPU/GPU 공통 2.5~3.5배 가속)"""
+    try:
+        import torch
+        from torch import Tensor
+        from typing import Optional, Tuple
+        import torch.nn.functional as F
+        import fish_speech.models.text2semantic.llama as llama_mod
+        import fish_speech.models.text2semantic.inference as inf_mod
+        from contextlib import nullcontext
+        import fish_speech.utils.context as ctx_mod
+
+        def _fast_autocast_exclude_mps(device_type: str, dtype: torch.dtype):
+            if device_type in ("mps", "cpu") and dtype == torch.float32:
+                return nullcontext()
+            if torch.cuda.is_available() and device_type == "cuda":
+                return torch.amp.autocast("cuda", dtype=dtype)
+            return nullcontext()
+
+        ctx_mod.autocast_exclude_mps = _fast_autocast_exclude_mps
+
+        def _fast_kv_update(self, input_pos: Tensor, k_val: Tensor, v_val: Tensor):
+            self.k_cache[:, :, input_pos] = k_val
+            self.v_cache[:, :, input_pos] = v_val
+            end_pos = int(input_pos[-1]) + 1
+            return self.k_cache[:, :, :end_pos], self.v_cache[:, :, :end_pos]
+
+        llama_mod.KVCache.update = _fast_kv_update
+
+        def _fast_embed(self, inp: Tensor, share_codebook_embeddings=True) -> Tensor:
+            if not hasattr(self, "_sem_min"):
+                self._sem_min = min(self.semantic_token_ids)
+                self._sem_max = max(self.semantic_token_ids)
+            embeds = []
+            for i in range(self.config.num_codebooks):
+                if share_codebook_embeddings:
+                    emb = self.codebook_embeddings(inp[:, i + 1] + i * self.config.codebook_size)
+                else:
+                    emb = self.codebook_embeddings(inp[:, i + 1])
+                embeds.append(emb)
+            vq_embeds_sum = torch.stack(embeds, dim=1).sum(dim=1)
+            vq_embeds_sum[(inp[:, 0] < self._sem_min) | (inp[:, 0] > self._sem_max)] = 0
+            return self.embeddings(inp[:, 0]) + vq_embeds_sum
+
+        llama_mod.BaseTransformer.embed = _fast_embed
+
+        def _fast_forward_generate(
+            self,
+            inp: Tensor,
+            input_pos: Optional[Tensor] = None,
+            return_all: bool = False,
+        ):
+            x = self.embed(inp, share_codebook_embeddings=self.config.share_codebook_embeddings)
+            if input_pos is None:
+                input_pos = torch.arange(inp.shape[-1], device=x.device)
+                max_seq_len = inp.shape[-1]
+            else:
+                max_seq_len = int(input_pos[-1]) + 1
+            mask = self.causal_mask[None, None, input_pos, :max_seq_len]
+            freqs_cis = self.freqs_cis[input_pos]
+            for layer in self.layers:
+                x = layer(x, freqs_cis, mask, input_pos=input_pos)
+            if x.size(1) > 1 and not return_all:
+                x = x[:, -1:]
+            slow_out = self.norm(x)
+            if self.config.is_reward_model:
+                token_logits = self.score_output(slow_out)
+            elif self.config.tie_word_embeddings:
+                token_logits = F.linear(slow_out, self.embeddings.weight)
+            else:
+                token_logits = self.output(slow_out)
+            return llama_mod.BaseTransformerForwardResult(logits=token_logits, hidden_states=x)
+
+        llama_mod.BaseTransformer.forward_generate = _fast_forward_generate
+
+        def _fast_forward_generate_fast(self, x: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+            x = x.view(1, 1, -1)
+            end_pos = int(input_pos[-1]) + 1
+            fast_mask = self.causal_mask[None, None, input_pos, :end_pos]
+            fast_freqs_cis = self.fast_freqs_cis[input_pos]
+            for layer in self.fast_layers:
+                x = layer(x, fast_freqs_cis, fast_mask, input_pos=input_pos)
+            fast_out = self.fast_norm(x)
+            return self.fast_output(fast_out)
+
+        llama_mod.DualARTransformer.forward_generate_fast = _fast_forward_generate_fast
+
+        def _fast_sample(
+            logits,
+            previous_tokens: Optional[torch.Tensor] = None,
+            **sampling_kwargs,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            logit_1d = logits[0, -1]
+            if logit_1d.size(-1) > 512:
+                if previous_tokens is not None:
+                    previous_tokens = previous_tokens.long()
+                    rep_pen = sampling_kwargs.get("repetition_penalty", 1.0)
+                    score = torch.gather(logit_1d, dim=0, index=previous_tokens)
+                    score = torch.where(score < 0, score * rep_pen, score / rep_pen)
+                    logit_1d.scatter_(dim=0, index=previous_tokens, src=score)
+                top_vals, top_idx = torch.topk(logit_1d, 256, dim=-1)
+                temp_val = max(float(sampling_kwargs.get("temperature", 0.7)), 1e-5)
+                top_p_val = sampling_kwargs.get("top_p", 0.7)
+                probs_top = torch.nn.functional.softmax(top_vals / temp_val, dim=-1)
+                cum_probs = torch.cumsum(probs_top, dim=-1)
+                remove_mask = cum_probs > top_p_val
+                remove_mask[0] = False
+                probs_top = probs_top.masked_fill(remove_mask, 0.0)
+                q = torch.empty_like(probs_top).exponential_(1)
+                local_idx = torch.argmax(probs_top / q, dim=-1, keepdim=True)
+                idx_next = top_idx.gather(0, local_idx).to(dtype=torch.int)
+                return idx_next, probs_top
+            probs = inf_mod.logits_to_probs(logits=logit_1d, previous_tokens=previous_tokens, **sampling_kwargs)
+            idx_next = inf_mod.multinomial_sample_one_no_sync(probs)
+            return idx_next, probs
+
+        inf_mod.sample = _fast_sample
+    except Exception:
+        pass
 
 
 def ensure_local_fish_installed():
-    import subprocess
     if not (FISH_ROOT / ".project-root").exists():
         shutil.rmtree(FISH_ROOT, ignore_errors=True)
         subprocess.run(
@@ -247,62 +433,103 @@ def get_local_fish_engine():
     if _LOCAL_FISH_ENGINE is not None:
         return _LOCAL_FISH_ENGINE
 
-    model_file = CKPT_DIR / "model.pth"
-    if not model_file.exists() or model_file.stat().st_size < 1200000000:
-        ensure_local_fish_installed()
+    with _ENGINE_LOCK:
+        if _LOCAL_FISH_ENGINE is not None:
+            return _LOCAL_FISH_ENGINE
 
-    if str(FISH_ROOT) not in sys.path:
-        sys.path.insert(0, str(FISH_ROOT))
+        model_file = CKPT_DIR / "model.pth"
+        if not model_file.exists() or model_file.stat().st_size < 1200000000:
+            ensure_local_fish_installed()
 
-    import torch
-    import fish_speech.inference_engine.reference_loader as ref_mod
+        if str(FISH_ROOT) not in sys.path:
+            sys.path.insert(0, str(FISH_ROOT))
 
-    def _safe_init(self):
-        self.ref_by_id = {}
-        self.ref_by_hash = {}
-        self.backend = "soundfile"
+        import torch
+        try:
+            torch.set_num_threads(max(4, (os.cpu_count() or 8) // 2))
+            torch.set_flush_denormal(True)
+        except Exception:
+            pass
 
-    def _safe_load_audio(self, reference_audio, sr):
-        if isinstance(reference_audio, (bytes, bytearray)):
-            wav, _ = librosa.load(io.BytesIO(reference_audio), sr=sr, mono=True)
-        else:
-            wav, _ = librosa.load(str(reference_audio), sr=sr, mono=True)
-        return wav
+        import fish_speech.inference_engine.reference_loader as ref_mod
 
-    ref_mod.ReferenceLoader.__init__ = _safe_init
-    ref_mod.ReferenceLoader.load_audio = _safe_load_audio
+        def _safe_init(self):
+            self.ref_by_id = {}
+            self.ref_by_hash = {}
+            self.backend = "soundfile"
 
-    orig_cwd = os.getcwd()
+        def _safe_load_audio(self, reference_audio, sr):
+            if isinstance(reference_audio, (bytes, bytearray)):
+                wav, _ = librosa.load(io.BytesIO(reference_audio), sr=sr, mono=True)
+            else:
+                wav, _ = librosa.load(str(reference_audio), sr=sr, mono=True)
+            return wav
+
+        ref_mod.ReferenceLoader.__init__ = _safe_init
+        ref_mod.ReferenceLoader.load_audio = _safe_load_audio
+        apply_fish_speed_patch()
+
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(str(FISH_ROOT))
+            from fish_speech.inference_engine import TTSInferenceEngine
+            from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
+            from fish_speech.models.vqgan.inference import load_model as load_decoder_model
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            precision = torch.half if device == "cuda" else torch.float32
+
+            llama_queue = launch_thread_safe_queue(
+                checkpoint_path=CKPT_DIR,
+                device=device,
+                precision=precision,
+                compile=False,
+            )
+            decoder_model = load_decoder_model(
+                config_name="firefly_gan_vq",
+                checkpoint_path=CKPT_DIR / "firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
+                device=device,
+            )
+            _LOCAL_FISH_ENGINE = TTSInferenceEngine(
+                llama_queue=llama_queue,
+                decoder_model=decoder_model,
+                compile=False,
+                precision=precision,
+            )
+        finally:
+            os.chdir(orig_cwd)
+
+        return _LOCAL_FISH_ENGINE
+
+
+def get_reference_wav_bytes(audio_path: Path) -> bytes:
+    key = f"{audio_path.resolve()}_{audio_path.stat().st_mtime_ns}"
+    if key not in _REF_BYTES_CACHE:
+        wav_10s, sr_10s = librosa.load(str(audio_path), sr=44100, mono=True, duration=10.5)
+        buf = io.BytesIO()
+        sf.write(buf, wav_10s, sr_10s, format="WAV")
+        _REF_BYTES_CACHE[key] = buf.getvalue()
+    return _REF_BYTES_CACHE[key]
+
+
+def _prewarm_engine_background():
+    """스튜디오 시작 시 백그라운드에서 로컬 엔진 및 기본 샘플 VQ 특징을 미리 메모리에 적재 (첫 클릭 딜레이 0초)"""
     try:
-        os.chdir(str(FISH_ROOT))
-        from fish_speech.inference_engine import TTSInferenceEngine
-        from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
-        from fish_speech.models.vqgan.inference import load_model as load_decoder_model
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        precision = torch.float32
-
-        llama_queue = launch_thread_safe_queue(
-            checkpoint_path=CKPT_DIR,
-            device=device,
-            precision=precision,
-            compile=False,
-        )
-        decoder_model = load_decoder_model(
-            config_name="firefly_gan_vq",
-            checkpoint_path=CKPT_DIR / "firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
-            device=device,
-        )
-        _LOCAL_FISH_ENGINE = TTSInferenceEngine(
-            llama_queue=llama_queue,
-            decoder_model=decoder_model,
-            compile=False,
-            precision=precision,
-        )
-    finally:
-        os.chdir(orig_cwd)
-
-    return _LOCAL_FISH_ENGINE
+        model_file = CKPT_DIR / "model.pth"
+        if not model_file.exists():
+            return
+        eng = get_local_fish_engine()
+        sample_p = find_sample_path(DEFAULT_VOICE_NAME)
+        if sample_p.exists():
+            ref_bytes = get_reference_wav_bytes(sample_p)
+            ref_txt = auto_recognize_text(sample_p)
+            from hashlib import sha256
+            ref_hash = sha256(ref_bytes).hexdigest()
+            if ref_hash not in eng.ref_by_hash:
+                prompt_tokens = eng.encode_reference(ref_bytes)
+                eng.ref_by_hash[ref_hash] = (prompt_tokens, ref_txt)
+    except Exception:
+        pass
 
 
 def prepare_10s_wav(audio_path: Path) -> Path:
@@ -333,7 +560,7 @@ def find_sample_path(voice_name: str) -> Path:
         p = d / voice_name
         if p.exists():
             return p
-    return G_DRIVE_SAMPLE_DIR / voice_name
+    return LOCAL_SAMPLE_DIR / voice_name
 
 
 def auto_recognize_text(audio_path: Path) -> str:
@@ -343,7 +570,7 @@ def auto_recognize_text(audio_path: Path) -> str:
             content = txt_path.read_text(encoding="utf-8").strip()
             if content:
                 return content
-    return ""
+    return DEFAULT_REF_TEXT if audio_path.name == DEFAULT_VOICE_NAME else ""
 
 
 def get_sample_files():
@@ -386,19 +613,31 @@ def get_saved_files_table(out_dir_str: str = ""):
     return rows
 
 
-def on_history_select(evt: gr.SelectData, table_data):
+def on_history_select(evt: gr.SelectData, table_data, current_out_dir: str = ""):
     try:
-        row_idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
-        row = table_data.iloc[row_idx] if hasattr(table_data, "iloc") else table_data[row_idx]
-        file_path = row[3]
-        if os.path.exists(file_path):
+        row_idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else int(evt.index)
+        file_path = ""
+        if hasattr(table_data, "iloc"):
+            row = table_data.iloc[row_idx]
+            file_path = str(row.iloc[3] if hasattr(row, "iloc") else row[3])
+        elif isinstance(table_data, dict) and "data" in table_data:
+            file_path = str(table_data["data"][row_idx][3])
+        elif isinstance(table_data, (list, tuple)) and len(table_data) > row_idx:
+            file_path = str(table_data[row_idx][3])
+
+        if (not file_path or not os.path.exists(file_path)) and current_out_dir:
+            rows = get_saved_files_table(current_out_dir)
+            if len(rows) > row_idx:
+                file_path = rows[row_idx][3]
+
+        if file_path and os.path.exists(file_path):
             return (
                 render_audio_html(file_path, "선택한 파일 재생", autoplay=True),
                 str(file_path),
                 f"재생 중: {Path(file_path).name}",
             )
-    except Exception:
-        pass
+    except Exception as e:
+        return gr.update(), gr.update(), f"목록 선택 오류: {e}"
     return gr.update(), gr.update(), gr.update()
 
 
@@ -406,7 +645,8 @@ def play_external_player(file_path: str):
     if not file_path or not os.path.exists(str(file_path)):
         return "재생할 파일이 없습니다."
     try:
-        os.startfile(str(file_path))
+        unlock_windows_foreground()
+        os.startfile(str(Path(file_path).resolve()))
         return f"윈도우 기본 플레이어로 재생: {Path(file_path).name}"
     except Exception as e:
         return f"외부 플레이어 실행 실패: {e}"
@@ -437,17 +677,21 @@ def set_preset_folder(preset_name: str):
     chosen = mapping.get(preset_name, str(DESKTOP_OUT_DIR))
     Path(chosen).mkdir(parents=True, exist_ok=True)
     save_settings({"output_dir": chosen})
-    return chosen, get_saved_files_table(chosen), f"저장 위치: {chosen}"
+    return chosen, get_saved_files_table(chosen), f"저장 위치 변경됨: {chosen}"
 
 
 def browse_custom_folder(current_dir: str):
     try:
+        unlock_windows_foreground()
         import tkinter as tk
         from tkinter import filedialog
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-        selected = filedialog.askdirectory(initialdir=current_dir or str(DESKTOP_OUT_DIR), title="저장 폴더 선택")
+        root.lift()
+        root.focus_force()
+        init_d = current_dir if (current_dir and os.path.exists(current_dir)) else str(DESKTOP_OUT_DIR)
+        selected = filedialog.askdirectory(parent=root, initialdir=init_d, title="음성 완성본 저장 폴더 선택")
         root.destroy()
         if selected:
             norm_path = str(Path(selected))
@@ -456,21 +700,20 @@ def browse_custom_folder(current_dir: str):
             return norm_path, get_saved_files_table(norm_path), f"저장 위치 변경됨: {norm_path}"
     except Exception as e:
         return current_dir, get_saved_files_table(current_dir), f"폴더 선택 실패: {e}"
-    return current_dir, get_saved_files_table(current_dir), "취소됨"
+    return current_dir, get_saved_files_table(current_dir), "폴더 변경이 취소되었습니다."
 
 
 def refresh_all(current_out_dir: str):
     choices = get_sample_files()
     first = choices[0] if choices else None
     preview_html, ref_text, sample_path_str = on_voice_select(first)
-    url = get_colab_url()
     return (
         gr.update(choices=choices, value=first),
         preview_html,
         ref_text,
         sample_path_str,
-        url,
-        get_status_label(),
+        "",
+        get_status_label(force_refresh=True),
         get_saved_files_table(current_out_dir),
     )
 
@@ -518,6 +761,7 @@ def generate_cloned_voice(
 ):
     global _CANCEL_REQUESTED
     _CANCEL_REQUESTED = False
+    t_start = time.time()
 
     out_dir = get_active_output_dir(output_dir_input)
     save_settings({"output_dir": str(out_dir)})
@@ -565,21 +809,22 @@ def generate_cloned_voice(
 
         try:
             if eng == "colab":
-                yield gr.update(), "", "코랩 연결 상태 확인 중 (1초)...", get_saved_files_table(str(out_dir))
                 active_colab_url = get_colab_url(colab_url_input)
                 if not active_colab_url:
                     if engine_choice == "코랩 전용":
-                        yield gr.update(), "", "현재 켜져 있는 코랩이 없습니다. (중단됨)", get_saved_files_table(str(out_dir))
+                        yield gr.update(), "", "현재 켜져 있는 코랩이 없습니다. 상단 '코랩 열기'를 실행하거나 '코랩 우선 (자동)'을 선택하세요.", get_saved_files_table(str(out_dir))
                         return
                     errors.append("코랩 오프라인 -> 내 PC 로컬 전환")
                     continue
 
-                yield gr.update(), "", f"코랩 서버에서 음성 생성 중... ({active_colab_url})", get_saved_files_table(str(out_dir))
-                c_colab = Client(active_colab_url)
+                yield gr.update(), "", f"코랩 T4 GPU에서 고속 생성 중... ({active_colab_url})", get_saved_files_table(str(out_dir))
+                c_colab = get_colab_client(active_colab_url)
+                # 기본 내장 목소리는 코랩 서버에 이미 존재하므로 매번 900KB 업로드 생략 (4초 단축)
+                upload_arg = None if voice_name == DEFAULT_VOICE_NAME else handle_file(str(trimmed_path))
                 try:
                     res = c_colab.predict(
                         voice_name,
-                        handle_file(str(trimmed_path)),
+                        upload_arg,
                         ref_text or "",
                         target_clean,
                         float(temp_val),
@@ -603,23 +848,21 @@ def generate_cloned_voice(
                     res_audio = res_audio["path"]
                 if res_audio and os.path.exists(str(res_audio)):
                     out_audio_tmp = str(res_audio)
-                    used_engine = "구글 코랩"
+                    used_engine = "구글 코랩 T4 GPU"
                     break
 
             elif eng == "local_fish":
-                yield gr.update(), "", "내 PC 로컬 엔진에서 음성 생성 중...", get_saved_files_table(str(out_dir))
+                yield gr.update(), "", "내 PC 로컬 고속 엔진에서 음성 생성 중...", get_saved_files_table(str(out_dir))
                 if str(FISH_ROOT) not in sys.path:
                     sys.path.insert(0, str(FISH_ROOT))
                 from fish_speech.utils.schema import ServeTTSRequest, ServeReferenceAudio
 
                 engine = get_local_fish_engine()
-                wav_10s, sr_10s = librosa.load(str(trimmed_path), sr=44100, mono=True, duration=10.0)
-                buf = io.BytesIO()
-                sf.write(buf, wav_10s, sr_10s, format="WAV")
+                ref_bytes = get_reference_wav_bytes(trimmed_path)
 
                 req = ServeTTSRequest(
                     text=target_clean,
-                    references=[ServeReferenceAudio(audio=buf.getvalue(), text=(ref_text or "").strip())],
+                    references=[ServeReferenceAudio(audio=ref_bytes, text=(ref_text or "").strip())],
                     max_new_tokens=1024,
                     chunk_length=200,
                     top_p=0.7,
@@ -634,10 +877,13 @@ def generate_cloned_voice(
                         return
                     if result.code == "final":
                         sr, wav_data = result.audio
-                        tmp_local = Path(os.environ.get("TEMP", ".")) / "local_fish_out.wav"
+                        tmp_local = Path(os.environ.get("TEMP", ".")) / f"local_fish_out_{os.getpid()}.wav"
                         sf.write(str(tmp_local), wav_data, sr)
                         out_audio_tmp = str(tmp_local)
                         used_engine = "내 PC 로컬"
+                        break
+                    elif result.code == "error":
+                        errors.append(f"local_fish: {result.error}")
                         break
                 if out_audio_tmp:
                     break
@@ -663,43 +909,56 @@ def generate_cloned_voice(
     final_path = out_dir / out_filename
     shutil.copy2(processed_tmp, final_path)
 
+    if load_settings().get("also_save_gdrive", True):
+        try:
+            if out_dir.resolve() != G_DRIVE_OUT_DIR.resolve():
+                G_DRIVE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(processed_tmp, G_DRIVE_OUT_DIR / out_filename)
+        except Exception:
+            pass
+
+    elapsed = time.time() - t_start
     yield (
         render_audio_html(final_path, "생성 결과", autoplay=True),
         str(final_path),
-        f"저장 완료 [{used_engine}] -> {final_path}",
+        f"✅ 완료 ({elapsed:.1f}초, {used_engine}) -> {final_path}",
         get_saved_files_table(str(out_dir)),
     )
 
 
-def open_selected_output_folder(out_dir_str: str):
+def open_selected_output_folder(out_dir_str: str, latest_file_str: str = ""):
     out_dir = get_active_output_dir(out_dir_str)
-    os.startfile(str(out_dir))
-    return f"폴더 열기: {out_dir}"
+    sel_file = Path(latest_file_str) if (latest_file_str and os.path.exists(latest_file_str)) else None
+    pop_explorer_foreground(out_dir, select_file=sel_file)
+    return f"📂 저장 폴더를 화면 맨 앞으로 열었습니다: {out_dir}"
 
 
-def open_sample_folder():
-    os.startfile(str(G_DRIVE_SAMPLE_DIR))
-    return f"샘플 폴더 열기: {G_DRIVE_SAMPLE_DIR}"
+def open_sample_folder(sample_file_str: str = ""):
+    target_dir = G_DRIVE_SAMPLE_DIR if G_DRIVE_SAMPLE_DIR.exists() else LOCAL_SAMPLE_DIR
+    sel_file = Path(sample_file_str) if (sample_file_str and os.path.exists(sample_file_str)) else None
+    pop_explorer_foreground(target_dir, select_file=sel_file)
+    return f"📂 샘플 폴더를 화면 맨 앞으로 열었습니다: {target_dir}"
 
 
 COLAB_DIRECT_URL = "https://colab.research.google.com/github/jinPP00/tts_studio/blob/main/fish_tts_studio.ipynb"
 
 
 def open_colab_page():
+    unlock_windows_foreground()
     try:
         os.startfile(COLAB_DIRECT_URL)
     except Exception:
         import webbrowser
         webbrowser.open(COLAB_DIRECT_URL)
-    return "내 드라이브 코랩 노트북을 열었습니다. (경고 팝업 없음)"
+    return "코랩 노트북을 열었습니다. 코랩 화면에서 ▶ 실행 버튼만 누르면 내 PC와 자동 연결됩니다."
 
 
 def shutdown_remote_colab(colab_url_input: str):
-    url = get_colab_url(colab_url_input)
+    url = get_colab_url(colab_url_input, force_refresh=True)
     if not url:
-        return "코랩 오프라인 (내 PC 로컬 대기)", "현재 연결된 코랩 세션이 없습니다. 코랩 화면의 '런타임 -> 세션 관리 -> 종료'를 눌러주세요."
+        return "코랩 오프라인 (내 PC 로컬 고속 엔진 대기)", "현재 연결된 코랩 세션이 없습니다."
     try:
-        c = Client(url)
+        c = get_colab_client(url)
         c.predict(api_name="/shutdown_colab")
     except Exception:
         pass
@@ -711,7 +970,9 @@ def shutdown_remote_colab(colab_url_input: str):
     except Exception:
         pass
     save_settings({"colab_url": ""})
-    return "코랩 오프라인 (내 PC 로컬 대기)", "코랩 GPU 세션을 반납(종료)했습니다."
+    _LAST_COLAB_CHECK["url"] = ""
+    _LAST_COLAB_CHECK["ts"] = time.time()
+    return "코랩 오프라인 (내 PC 로컬 고속 엔진 대기)", "코랩 GPU 세션을 반납(종료)했습니다."
 
 
 CALM_CSS = """
@@ -724,12 +985,11 @@ initial_out_dir = get_active_output_dir(initial_cfg.get("output_dir", str(DESKTO
 initial_choices = get_sample_files()
 initial_voice = initial_choices[0] if initial_choices else None
 initial_preview_html, initial_ref_text, initial_sample_path = on_voice_select(initial_voice)
-initial_colab_url = get_colab_url()
 initial_table = get_saved_files_table(str(initial_out_dir))
 initial_latest_out_path = initial_table[0][3] if initial_table else ""
 initial_output_html = render_audio_html(initial_latest_out_path, "최근 생성 결과", autoplay=False)
 
-with gr.Blocks(title="AI 음성 복제 스튜디오", css=CALM_CSS, theme=gr.themes.Monochrome()) as demo:
+with gr.Blocks(title="AI 음성 복제 스튜디오") as demo:
     sample_path_state = gr.State(initial_sample_path)
     output_path_state = gr.State(initial_latest_out_path)
 
@@ -763,7 +1023,7 @@ with gr.Blocks(title="AI 음성 복제 스튜디오", css=CALM_CSS, theme=gr.the
             folder_preset_radio = gr.Radio(
                 choices=["바탕화면 (TTS_완성본)", "다운로드 (TTS_완성본)", "G드라이브 (TTS\\완성본)"],
                 value="바탕화면 (TTS_완성본)" if str(initial_out_dir) == str(DESKTOP_OUT_DIR) else None,
-                label="저장 위치",
+                label="저장 위치 빠른 선택",
             )
             output_dir_box = gr.Textbox(value=str(initial_out_dir), label="저장 폴더 경로")
             with gr.Row():
@@ -793,7 +1053,7 @@ with gr.Blocks(title="AI 음성 복제 스튜디오", css=CALM_CSS, theme=gr.the
                     temp_slider = gr.Slider(0.3, 1.0, value=0.7, step=0.05, label="억양 변화 (기본 0.7)")
                 with gr.Row():
                     trim_chk = gr.Checkbox(value=True, label="앞뒤 무음 제거")
-                    colab_url_box = gr.Textbox(value=initial_colab_url, placeholder="https://xxxx.gradio.live", label="코랩 주소 직접 입력")
+                    colab_url_box = gr.Textbox(value="", placeholder="비워두면 자동 연결됨 (수동 입력 시에만 기입)", label="코랩 주소 수동 지정")
 
             with gr.Row():
                 gen_btn = gr.Button("음성 생성", variant="primary", scale=3)
@@ -815,34 +1075,64 @@ with gr.Blocks(title="AI 음성 복제 스튜디오", css=CALM_CSS, theme=gr.the
         fn=on_voice_select,
         inputs=[voice_dropdown],
         outputs=[sample_audio_html, ref_text_box, sample_path_state],
+        queue=False,
     )
-    play_sample_ext_btn.click(fn=play_external_player, inputs=[sample_path_state], outputs=[status_box])
-    play_output_ext_btn.click(fn=play_external_player, inputs=[output_path_state], outputs=[status_box])
+    play_sample_ext_btn.click(
+        fn=play_external_player,
+        inputs=[sample_path_state],
+        outputs=[status_box],
+        queue=False,
+    )
+    play_output_ext_btn.click(
+        fn=play_external_player,
+        inputs=[output_path_state],
+        outputs=[status_box],
+        queue=False,
+    )
 
     folder_preset_radio.change(
         fn=set_preset_folder,
         inputs=[folder_preset_radio],
         outputs=[output_dir_box, history_table, status_box],
+        queue=False,
     )
     browse_folder_btn.click(
         fn=browse_custom_folder,
         inputs=[output_dir_box],
         outputs=[output_dir_box, history_table, status_box],
+        queue=False,
     )
-    output_dir_box.change(fn=lambda d: get_saved_files_table(d), inputs=[output_dir_box], outputs=[history_table])
+    output_dir_box.change(
+        fn=lambda d: get_saved_files_table(d),
+        inputs=[output_dir_box],
+        outputs=[history_table],
+        queue=False,
+    )
     refresh_btn.click(
         fn=refresh_all,
         inputs=[output_dir_box],
         outputs=[voice_dropdown, sample_audio_html, ref_text_box, sample_path_state, colab_url_box, colab_status_txt, history_table],
+        queue=False,
     )
-    open_sample_btn.click(fn=open_sample_folder, inputs=[], outputs=[status_box])
-    open_output_btn.click(fn=open_selected_output_folder, inputs=[output_dir_box], outputs=[status_box])
-    colab_btn.click(fn=open_colab_page, inputs=[], outputs=[status_box])
-    colab_kill_btn.click(fn=shutdown_remote_colab, inputs=[colab_url_box], outputs=[colab_status_txt, status_box])
+    open_sample_btn.click(
+        fn=open_sample_folder,
+        inputs=[sample_path_state],
+        outputs=[status_box],
+        queue=False,
+    )
+    open_output_btn.click(
+        fn=open_selected_output_folder,
+        inputs=[output_dir_box, output_path_state],
+        outputs=[status_box],
+        queue=False,
+    )
+    colab_btn.click(fn=open_colab_page, inputs=[], outputs=[status_box], queue=False)
+    colab_kill_btn.click(fn=shutdown_remote_colab, inputs=[colab_url_box], outputs=[colab_status_txt, status_box], queue=False)
     save_sample_btn.click(
         fn=save_new_sample,
         inputs=[new_upload, new_name],
         outputs=[voice_dropdown, sample_audio_html, ref_text_box, sample_path_state, status_box],
+        queue=False,
     )
 
     gen_event = gen_btn.click(
@@ -862,19 +1152,23 @@ with gr.Blocks(title="AI 음성 복제 스튜디오", css=CALM_CSS, theme=gr.the
         outputs=[output_audio_html, output_path_state, status_box, history_table],
         api_name="generate_cloned_voice",
     )
-    stop_btn.click(fn=request_cancel, inputs=[], outputs=[status_box], cancels=[gen_event])
+    stop_btn.click(fn=request_cancel, inputs=[], outputs=[status_box], cancels=[gen_event], queue=False)
 
     history_table.select(
         fn=on_history_select,
-        inputs=[history_table],
+        inputs=[history_table, output_dir_box],
         outputs=[output_audio_html, output_path_state, status_box],
+        queue=False,
     )
 
 if __name__ == "__main__":
+    threading.Thread(target=_prewarm_engine_background, daemon=True).start()
     demo.launch(
         server_name="127.0.0.1",
         server_port=7865,
         inbrowser=False,
+        css=CALM_CSS,
+        theme=gr.themes.Monochrome(),
         allowed_paths=[
             str(DESKTOP_OUT_DIR),
             str(DOWNLOADS_OUT_DIR),

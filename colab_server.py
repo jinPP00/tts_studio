@@ -21,6 +21,7 @@ CKPT_DIR = FISH_DIR / "checkpoints" / "fish-speech-1.5"
 SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+DEFAULT_VOICE_NAME = "recording-2026.-10.-16.-오후-1-19-43.wav"
 DEFAULT_REF_TEXT = "아컨텐츠 제작을 위해서 더빙을 해야는데 어떻게 진행을 해야 되는지 고민이시군요 고객님 그러실 때는 타입캐스트를 사용해 보시는 걸 추천드리는데요 다양한 에이아의 캐릭터들과 자연스러운,"
 
 
@@ -50,7 +51,7 @@ def download_url_to_file(url: str, dst: Path, min_size: int = 100) -> bool:
 
 
 def ensure_default_sample():
-    target_wav = SAMPLE_DIR / "recording-2026.-10.-16.-오후-1-19-43.wav"
+    target_wav = SAMPLE_DIR / DEFAULT_VOICE_NAME
     target_txt = SAMPLE_DIR / "recording-2026.-10.-16.-오후-1-19-43.txt"
     if not target_wav.exists() or target_wav.stat().st_size < 1000:
         for b64_url in [
@@ -203,6 +204,117 @@ def _safe_load_audio(self, reference_audio, sr):
 ref_mod.ReferenceLoader.__init__ = _safe_init
 ref_mod.ReferenceLoader.load_audio = _safe_load_audio
 
+
+def apply_fish_speed_patch():
+    try:
+        from torch import Tensor
+        from typing import Optional, Tuple
+        import torch.nn.functional as F
+        import fish_speech.models.text2semantic.llama as llama_mod
+        import fish_speech.models.text2semantic.inference as inf_mod
+
+        def _fast_kv_update(self, input_pos: Tensor, k_val: Tensor, v_val: Tensor):
+            self.k_cache[:, :, input_pos] = k_val
+            self.v_cache[:, :, input_pos] = v_val
+            end_pos = int(input_pos[-1]) + 1
+            return self.k_cache[:, :, :end_pos], self.v_cache[:, :, :end_pos]
+
+        llama_mod.KVCache.update = _fast_kv_update
+
+        def _fast_embed(self, inp: Tensor, share_codebook_embeddings=True) -> Tensor:
+            if not hasattr(self, "_sem_min"):
+                self._sem_min = min(self.semantic_token_ids)
+                self._sem_max = max(self.semantic_token_ids)
+            embeds = []
+            for i in range(self.config.num_codebooks):
+                if share_codebook_embeddings:
+                    emb = self.codebook_embeddings(inp[:, i + 1] + i * self.config.codebook_size)
+                else:
+                    emb = self.codebook_embeddings(inp[:, i + 1])
+                embeds.append(emb)
+            vq_embeds_sum = torch.stack(embeds, dim=1).sum(dim=1)
+            vq_embeds_sum[(inp[:, 0] < self._sem_min) | (inp[:, 0] > self._sem_max)] = 0
+            return self.embeddings(inp[:, 0]) + vq_embeds_sum
+
+        llama_mod.BaseTransformer.embed = _fast_embed
+
+        def _fast_forward_generate(
+            self,
+            inp: Tensor,
+            input_pos: Optional[Tensor] = None,
+            return_all: bool = False,
+        ):
+            x = self.embed(inp, share_codebook_embeddings=self.config.share_codebook_embeddings)
+            if input_pos is None:
+                input_pos = torch.arange(inp.shape[-1], device=x.device)
+                max_seq_len = inp.shape[-1]
+            else:
+                max_seq_len = int(input_pos[-1]) + 1
+            mask = self.causal_mask[None, None, input_pos, :max_seq_len]
+            freqs_cis = self.freqs_cis[input_pos]
+            for layer in self.layers:
+                x = layer(x, freqs_cis, mask, input_pos=input_pos)
+            if x.size(1) > 1 and not return_all:
+                x = x[:, -1:]
+            slow_out = self.norm(x)
+            if self.config.is_reward_model:
+                token_logits = self.score_output(slow_out)
+            elif self.config.tie_word_embeddings:
+                token_logits = F.linear(slow_out, self.embeddings.weight)
+            else:
+                token_logits = self.output(slow_out)
+            return llama_mod.BaseTransformerForwardResult(logits=token_logits, hidden_states=x)
+
+        llama_mod.BaseTransformer.forward_generate = _fast_forward_generate
+
+        def _fast_forward_generate_fast(self, x: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+            x = x.view(1, 1, -1)
+            end_pos = int(input_pos[-1]) + 1
+            fast_mask = self.causal_mask[None, None, input_pos, :end_pos]
+            fast_freqs_cis = self.fast_freqs_cis[input_pos]
+            for layer in self.fast_layers:
+                x = layer(x, fast_freqs_cis, fast_mask, input_pos=input_pos)
+            fast_out = self.fast_norm(x)
+            return self.fast_output(fast_out)
+
+        llama_mod.DualARTransformer.forward_generate_fast = _fast_forward_generate_fast
+
+        def _fast_sample(
+            logits,
+            previous_tokens: Optional[torch.Tensor] = None,
+            **sampling_kwargs,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            logit_1d = logits[0, -1]
+            if logit_1d.size(-1) > 512:
+                if previous_tokens is not None:
+                    previous_tokens = previous_tokens.long()
+                    rep_pen = sampling_kwargs.get("repetition_penalty", 1.0)
+                    score = torch.gather(logit_1d, dim=0, index=previous_tokens)
+                    score = torch.where(score < 0, score * rep_pen, score / rep_pen)
+                    logit_1d.scatter_(dim=0, index=previous_tokens, src=score)
+                top_vals, top_idx = torch.topk(logit_1d, 256, dim=-1)
+                temp_val = max(float(sampling_kwargs.get("temperature", 0.7)), 1e-5)
+                top_p_val = sampling_kwargs.get("top_p", 0.7)
+                probs_top = torch.nn.functional.softmax(top_vals / temp_val, dim=-1)
+                cum_probs = torch.cumsum(probs_top, dim=-1)
+                remove_mask = cum_probs > top_p_val
+                remove_mask[0] = False
+                probs_top = probs_top.masked_fill(remove_mask, 0.0)
+                q = torch.empty_like(probs_top).exponential_(1)
+                local_idx = torch.argmax(probs_top / q, dim=-1, keepdim=True)
+                idx_next = top_idx.gather(0, local_idx).to(dtype=torch.int)
+                return idx_next, probs_top
+            probs = inf_mod.logits_to_probs(logits=logit_1d, previous_tokens=previous_tokens, **sampling_kwargs)
+            idx_next = inf_mod.multinomial_sample_one_no_sync(probs)
+            return idx_next, probs
+
+        inf_mod.sample = _fast_sample
+    except Exception:
+        pass
+
+
+apply_fish_speed_patch()
+
 from fish_speech.inference_engine import TTSInferenceEngine
 from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
 from fish_speech.models.vqgan.inference import load_model as load_decoder_model
@@ -211,7 +323,7 @@ from fish_speech.utils.schema import ServeTTSRequest, ServeReferenceAudio
 device = "cuda" if torch.cuda.is_available() else "cpu"
 precision = torch.half if device == "cuda" else torch.float32
 
-print(f"4/4 엔진 시작 중 ({'T4 GPU 가속' if device == 'cuda' else 'CPU 모드'})...")
+print(f"4/4 엔진 시작 중 ({'T4 GPU 고속 가속' if device == 'cuda' else 'CPU 고속 모드'})...")
 if "tts_engine" not in globals():
     llama_queue = launch_thread_safe_queue(
         checkpoint_path=CKPT_DIR,
@@ -230,6 +342,30 @@ if "tts_engine" not in globals():
         compile=False,
         precision=precision,
     )
+
+_COLAB_REF_CACHE = {}
+
+
+def get_colab_ref_bytes(audio_path: Path) -> bytes:
+    key = f"{audio_path.resolve()}_{audio_path.stat().st_mtime_ns}"
+    if key not in _COLAB_REF_CACHE:
+        wav_10s, sr_10s = librosa.load(str(audio_path), sr=44100, mono=True, duration=10.5)
+        buf = io.BytesIO()
+        sf.write(buf, wav_10s, sr_10s, format="WAV")
+        _COLAB_REF_CACHE[key] = buf.getvalue()
+    return _COLAB_REF_CACHE[key]
+
+
+try:
+    _def_p = SAMPLE_DIR / DEFAULT_VOICE_NAME
+    if _def_p.exists():
+        _b = get_colab_ref_bytes(_def_p)
+        from hashlib import sha256
+        _h = sha256(_b).hexdigest()
+        if _h not in tts_engine.ref_by_hash:
+            tts_engine.ref_by_hash[_h] = (tts_engine.encode_reference(_b), DEFAULT_REF_TEXT)
+except Exception:
+    pass
 
 import gradio as gr
 gr.close_all()
@@ -263,7 +399,7 @@ def render_audio_html(file_path, label="오디오 재생", autoplay=False):
 def get_sample_list():
     ensure_default_sample()
     files = sorted([f.name for f in SAMPLE_DIR.iterdir() if f.is_file() and f.suffix.lower() in exts])
-    return files if files else ["recording-2026.-10.-16.-오후-1-19-43.wav"]
+    return files if files else [DEFAULT_VOICE_NAME]
 
 
 def load_saved_ref_text(voice_name):
@@ -277,14 +413,14 @@ def load_saved_ref_text(voice_name):
 
 def on_colab_voice_change(voice_name):
     ensure_default_sample()
-    p = SAMPLE_DIR / (voice_name or "recording-2026.-10.-16.-오후-1-19-43.wav")
+    p = SAMPLE_DIR / (voice_name or DEFAULT_VOICE_NAME)
     return render_audio_html(p, "샘플 미리듣기", autoplay=False), load_saved_ref_text(voice_name)
 
 
 def refresh_voices():
     choices = get_sample_list()
     first = choices[0] if choices else None
-    p = SAMPLE_DIR / (first or "recording-2026.-10.-16.-오후-1-19-43.wav")
+    p = SAMPLE_DIR / (first or DEFAULT_VOICE_NAME)
     return gr.update(choices=choices, value=first), render_audio_html(p, "샘플 미리듣기", autoplay=False), load_saved_ref_text(first)
 
 
@@ -315,6 +451,7 @@ def shutdown_colab_runtime():
 def generate_tts(voice_name, uploaded_file, ref_text, target_text, temp, top_p, rep_penalty):
     global _CANCEL_COLAB
     _CANCEL_COLAB = False
+    t0 = time.time()
     if not target_text or not target_text.strip():
         return None, "대본을 입력해 주세요.", render_audio_html(None, "생성 결과")
 
@@ -331,7 +468,7 @@ def generate_tts(voice_name, uploaded_file, ref_text, target_text, temp, top_p, 
     else:
         ensure_default_sample()
         if not voice_name or voice_name.startswith("("):
-            voice_name = "recording-2026.-10.-16.-오후-1-19-43.wav"
+            voice_name = DEFAULT_VOICE_NAME
         audio_path = SAMPLE_DIR / voice_name
         if not audio_path.exists():
             cands = list(SAMPLE_DIR.glob("*.wav"))
@@ -343,10 +480,7 @@ def generate_tts(voice_name, uploaded_file, ref_text, target_text, temp, top_p, 
             except Exception:
                 pass
 
-    wav_10s, sr_10s = librosa.load(str(audio_path), sr=44100, mono=True, duration=10.0)
-    buf = io.BytesIO()
-    sf.write(buf, wav_10s, sr_10s, format="WAV")
-    audio_bytes = buf.getvalue()
+    audio_bytes = get_colab_ref_bytes(audio_path)
 
     req = ServeTTSRequest(
         text=target_text.strip(),
@@ -372,7 +506,7 @@ def generate_tts(voice_name, uploaded_file, ref_text, target_text, temp, top_p, 
             out_path = OUTPUT_DIR / out_filename
             sf.write(str(out_path), wav_data, sr)
             wav_int16 = (np.clip(wav_data, -1.0, 1.0) * 32767).astype(np.int16)
-            return (sr, wav_int16), f"완료: {out_filename}", render_audio_html(out_path, "생성 결과", autoplay=True)
+            return (sr, wav_int16), f"✅ 완료 ({time.time()-t0:.1f}초): {out_filename}", render_audio_html(out_path, "생성 결과", autoplay=True)
         elif result.code == "error":
             return None, f"오류: {result.error}", render_audio_html(None, "생성 결과")
 
@@ -382,8 +516,8 @@ def generate_tts(voice_name, uploaded_file, ref_text, target_text, temp, top_p, 
 init_sample_name = get_sample_list()[0]
 init_sample_html = render_audio_html(SAMPLE_DIR / init_sample_name, "샘플 미리듣기", autoplay=False)
 
-with gr.Blocks(title="AI 음성 복제 (코랩)", theme=gr.themes.Monochrome()) as demo:
-    mode_str = "T4 GPU 모드" if device == "cuda" else "CPU 모드"
+with gr.Blocks(title="AI 음성 복제 (코랩)") as demo:
+    mode_str = "T4 GPU 고속 모드" if device == "cuda" else "CPU 고속 모드"
     with gr.Row():
         gr.Markdown(f"### AI 음성 복제 스튜디오 ({mode_str})")
         shutdown_btn = gr.Button("코랩 세션 완전 종료 (반납)", size="sm", scale=0)
@@ -420,21 +554,22 @@ with gr.Blocks(title="AI 음성 복제 (코랩)", theme=gr.themes.Monochrome()) 
                 top_p_slider = gr.Slider(0.1, 1.0, value=0.7, step=0.05, label="Top-P")
                 rep_slider = gr.Slider(0.9, 2.0, value=1.2, step=0.05, label="Repetition Penalty")
 
-    voice_dropdown.change(fn=on_colab_voice_change, inputs=[voice_dropdown], outputs=[sample_player_html, ref_text_box])
-    refresh_btn.click(fn=refresh_voices, inputs=[], outputs=[voice_dropdown, sample_player_html, ref_text_box])
+    voice_dropdown.change(fn=on_colab_voice_change, inputs=[voice_dropdown], outputs=[sample_player_html, ref_text_box], queue=False)
+    refresh_btn.click(fn=refresh_voices, inputs=[], outputs=[voice_dropdown, sample_player_html, ref_text_box], queue=False)
     gen_ev = gen_btn.click(
         fn=generate_tts,
         inputs=[voice_dropdown, upload_box, ref_text_box, target_text_box, temp_slider, top_p_slider, rep_slider],
         outputs=[audio_out, status_box, output_player_html],
         api_name="generate_tts",
     )
-    stop_btn.click(fn=cancel_colab_gen, inputs=[], outputs=[status_box], cancels=[gen_ev])
-    shutdown_btn.click(fn=shutdown_colab_runtime, inputs=[], outputs=[status_box], api_name="shutdown_colab")
+    stop_btn.click(fn=cancel_colab_gen, inputs=[], outputs=[status_box], cancels=[gen_ev], queue=False)
+    shutdown_btn.click(fn=shutdown_colab_runtime, inputs=[], outputs=[status_box], api_name="shutdown_colab", queue=False)
 
 _, _, share_url = demo.launch(
     share=True,
     inline=True,
     prevent_thread_lock=True,
+    theme=gr.themes.Monochrome(),
     allowed_paths=[str(SAMPLE_DIR), str(OUTPUT_DIR), "/tmp"],
 )
 if share_url:
