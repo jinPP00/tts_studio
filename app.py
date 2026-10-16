@@ -682,7 +682,7 @@ def open_sample_folder():
     return f"샘플 폴더 열기: {G_DRIVE_SAMPLE_DIR}"
 
 
-COLAB_DIRECT_URL = "https://colab.research.google.com/drive/1IX0koAzG3AQD4FyZuItQLVMjEYEM_2Zt?authuser=jinppp1508@gmail.com"
+COLAB_DIRECT_URL = "https://colab.research.google.com/github/jinPP00/tts_studio/blob/main/fish_tts_studio.ipynb"
 
 
 def open_colab_page():
