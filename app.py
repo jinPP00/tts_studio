@@ -293,12 +293,20 @@ def get_active_output_dir(custom_dir: str = "") -> Path:
 def is_colab_alive(url: str) -> bool:
     if not url or not url.strip().startswith("http"):
         return False
-    try:
-        req = urllib.request.Request(f"{url.strip().rstrip('/')}/config", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=1.2) as r:
-            return r.status == 200
-    except Exception:
-        return False
+    base = url.strip().rstrip("/")
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(f"{base}/", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5.0) as r:
+                if r.status == 200:
+                    return True
+        except urllib.error.HTTPError as he:
+            if he.code == 404:
+                return False
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.3)
+    return False
 
 
 def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> str:
@@ -311,11 +319,11 @@ def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> st
             return url
 
     now = time.time()
-    if not force_refresh and (now - _LAST_COLAB_CHECK["ts"] < 4.0):
+    if not force_refresh and _LAST_COLAB_CHECK["url"] and (now - _LAST_COLAB_CHECK["ts"] < 10.0):
         return _LAST_COLAB_CHECK["url"]
 
     saved = load_settings().get("colab_url", "").strip()
-    if saved and is_colab_alive(saved):
+    if not force_refresh and saved and is_colab_alive(saved):
         _LAST_COLAB_CHECK["ts"] = now
         _LAST_COLAB_CHECK["url"] = saved
         return saved
@@ -325,7 +333,7 @@ def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> st
             f"https://ntfy.sh/{NTFY_TOPIC}/json?poll=1&since=all",
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        with urllib.request.urlopen(req, timeout=1.5) as resp:
+        with urllib.request.urlopen(req, timeout=4.5) as resp:
             lines = [json.loads(line) for line in resp.read().decode("utf-8").splitlines() if line.strip()]
             msgs = [m.get("message", "").strip() for m in lines if m.get("event") == "message"]
             for msg in reversed(msgs):
@@ -340,6 +348,11 @@ def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> st
                     break
     except Exception:
         pass
+
+    if saved and is_colab_alive(saved):
+        _LAST_COLAB_CHECK["ts"] = now
+        _LAST_COLAB_CHECK["url"] = saved
+        return saved
 
     _LAST_COLAB_CHECK["ts"] = now
     _LAST_COLAB_CHECK["url"] = ""
@@ -904,7 +917,9 @@ def generate_cloned_voice(
 
         try:
             if eng == "colab":
-                active_colab_url = get_colab_url(colab_url_input)
+                active_colab_url = get_colab_url(colab_url_input, force_refresh=not bool(_LAST_COLAB_CHECK["url"]))
+                if not active_colab_url:
+                    active_colab_url = get_colab_url(colab_url_input, force_refresh=True)
                 if not active_colab_url:
                     if engine_choice == "코랩 GPU":
                         yield gr.update(), "", "연결된 코랩이 없습니다. '자동' 또는 '내 PC'를 선택하세요.", get_saved_files_table(str(out_dir))
@@ -1744,6 +1759,20 @@ with gr.Blocks(title="Voice Studio") as demo:
         fn=on_history_select,
         inputs=[history_table, output_dir_box],
         outputs=[output_audio_html, output_path_state, status_box],
+        queue=False,
+    )
+
+    status_timer = gr.Timer(6.0)
+    status_timer.tick(
+        fn=lambda: get_status_label(force_refresh=False),
+        inputs=[],
+        outputs=[colab_status_txt],
+        queue=False,
+    )
+    demo.load(
+        fn=lambda: get_status_label(force_refresh=True),
+        inputs=[],
+        outputs=[colab_status_txt],
         queue=False,
     )
 
