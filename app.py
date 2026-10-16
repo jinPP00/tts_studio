@@ -539,14 +539,14 @@ def get_local_fish_engine():
                 wav, _ = librosa.load(str(reference_audio), sr=sr, mono=True)
             return wav
 
-        def _safe_load_by_hash(self, references, use_memory_cache: str = "off"):
+        def _safe_load_by_hash(self, references, use_cache: str = "off"):
             prompt_tokens, prompt_texts = [], []
             for ref in references:
                 key = hashlib.sha256(ref.audio + (ref.text or "").encode("utf-8")).hexdigest()
-                if use_memory_cache == "on" and key in self.ref_by_hash:
+                if use_cache == "on" and key in self.ref_by_hash:
                     tok, txt = self.ref_by_hash[key]
                 else:
-                    tok = self.vq_manager.encode_reference(ref.audio, enable_reference_audio=True)
+                    tok = self.encode_reference(reference_audio=ref.audio, enable_reference_audio=True)
                     txt = ref.text
                     self.ref_by_hash[key] = (tok, txt)
                 prompt_tokens.append(tok)
