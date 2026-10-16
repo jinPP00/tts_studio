@@ -3,6 +3,7 @@ fish-speech/
 
 # Runtime & user settings
 settings.json
+.cache/
 __pycache__/
 *.pyc
 *.pyo

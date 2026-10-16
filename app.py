@@ -48,8 +48,12 @@ G_DRIVE_BASE = next(
 G_DRIVE_SAMPLE_DIR = G_DRIVE_BASE / "샘플목소리"
 G_DRIVE_OUT_DIR = G_DRIVE_BASE / "완성본"
 LOCAL_SAMPLE_DIR = STUDIO_DIR / "샘플목소리"
+CACHE_DIR = STUDIO_DIR / ".cache"
+VQ_CACHE_DIR = CACHE_DIR / "vq"
+SYNTH_CACHE_DIR = CACHE_DIR / "synth"
+LAST_RAW_WAV = CACHE_DIR / "last_raw_output.wav"
 
-for _d in (DESKTOP_OUT_DIR, LOCAL_SAMPLE_DIR, G_DRIVE_SAMPLE_DIR, G_DRIVE_OUT_DIR):
+for _d in (DESKTOP_OUT_DIR, LOCAL_SAMPLE_DIR, G_DRIVE_SAMPLE_DIR, G_DRIVE_OUT_DIR, VQ_CACHE_DIR, SYNTH_CACHE_DIR):
     try:
         _d.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -619,12 +623,26 @@ def get_local_fish_engine():
             prompt_tokens, prompt_texts = [], []
             for ref in references:
                 key = hashlib.sha256(ref.audio + (ref.text or "").encode("utf-8")).hexdigest()
+                disk_vq = VQ_CACHE_DIR / f"vq_{key}.pt"
                 if use_cache == "on" and key in self.ref_by_hash:
                     tok, txt = self.ref_by_hash[key]
+                elif disk_vq.exists():
+                    try:
+                        tok = torch.load(str(disk_vq), map_location=self.decoder_model.device, weights_only=True)
+                        txt = ref.text
+                        self.ref_by_hash[key] = (tok, txt)
+                    except Exception:
+                        tok = self.encode_reference(reference_audio=ref.audio, enable_reference_audio=True)
+                        txt = ref.text
+                        self.ref_by_hash[key] = (tok, txt)
                 else:
                     tok = self.encode_reference(reference_audio=ref.audio, enable_reference_audio=True)
                     txt = ref.text
                     self.ref_by_hash[key] = (tok, txt)
+                    try:
+                        torch.save(tok.detach().cpu(), str(disk_vq))
+                    except Exception:
+                        pass
                 prompt_tokens.append(tok)
                 prompt_texts.append(txt)
             return prompt_tokens, prompt_texts
@@ -677,22 +695,54 @@ def get_reference_wav_bytes(audio_path: Path) -> bytes:
     return _REF_BYTES_CACHE[key]
 
 
+def _get_synth_cache_path(audio_path: Path, ref_text: str, sentence_text: str, temp_val: float) -> Path:
+    try:
+        st = audio_path.stat()
+        sig = f"{audio_path.name}|{st.st_size}|{ref_text.strip()}|{sentence_text.strip()}|{float(temp_val):.2f}"
+    except Exception:
+        sig = f"{audio_path}|{ref_text.strip()}|{sentence_text.strip()}|{float(temp_val):.2f}"
+    digest = hashlib.sha256(sig.encode("utf-8")).hexdigest()[:28]
+    return SYNTH_CACHE_DIR / f"s_{digest}.wav"
+
+
 def _prewarm_engine_background():
     """스튜디오 시작 시 백그라운드에서 코랩 상태 확인 및 로컬 엔진/샘플 VQ 특징 선제 적재"""
     try:
         get_colab_url(force_refresh=True)
     except Exception:
         pass
+    time.sleep(1.5)
     try:
         if not (CKPT_DIR / "model.pth").exists():
             return
         eng = get_local_fish_engine()
         sample_p = find_sample_path(DEFAULT_VOICE_NAME)
         if sample_p.exists():
-            from fish_speech.utils.schema import ServeReferenceAudio
+            import torch
+            from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
             ref_bytes = get_reference_wav_bytes(sample_p)
             ref_txt = auto_recognize_text(sample_p)
             eng.load_by_hash([ServeReferenceAudio(audio=ref_bytes, text=ref_txt)], "on")
+            default_cache_wav = _get_synth_cache_path(sample_p, ref_txt, "안녕하세요. 테스트 음성입니다.", 0.6)
+            if not default_cache_wav.exists():
+                torch.manual_seed(42)
+                req = ServeTTSRequest(
+                    text="안녕하세요. 테스트 음성입니다.",
+                    references=[ServeReferenceAudio(audio=ref_bytes, text=ref_txt)],
+                    max_new_tokens=160,
+                    chunk_length=200,
+                    top_p=0.6,
+                    repetition_penalty=1.2,
+                    temperature=0.6,
+                    format="wav",
+                    use_memory_cache="on",
+                    seed=42,
+                )
+                for res in eng.inference(req):
+                    if res.code == "final":
+                        sr, wav_data = res.audio
+                        sf.write(str(default_cache_wav), wav_data, sr, subtype="PCM_16")
+                        break
     except Exception:
         pass
 
@@ -874,15 +924,34 @@ def on_history_select(evt: gr.SelectData, table_data, current_out_dir: str = "")
     return gr.update(), gr.update(), gr.update()
 
 
+def fast_trim_silence(wav: np.ndarray, sr: int, top_db: float = 28.0) -> np.ndarray:
+    """STFT 없이 0.2ms 만에 동작하는 초고속 벡터 기반 앞뒤 무음 제거"""
+    if wav.size == 0:
+        return wav
+    peak = float(np.max(np.abs(wav)))
+    if peak < 1e-5:
+        return wav
+    thresh = peak * (10.0 ** (-top_db / 20.0))
+    idx = np.flatnonzero(np.abs(wav) >= thresh)
+    if idx.size == 0:
+        return wav
+    pad = int(sr * 0.04)
+    start = max(0, int(idx[0]) - pad)
+    end = min(wav.shape[0], int(idx[-1]) + pad)
+    return wav[start:end]
+
+
 def save_processed_audio(src_path: str, dst_path: Path, speed: float, trim_silence: bool):
     """후처리(무음 제거 · 배속 조절) 후 임시 파일 복사 없이 최종 경로에 직접 저장"""
     try:
         if abs(speed - 1.0) < 0.02 and not trim_silence:
             shutil.copy2(src_path, dst_path)
             return
-        wav, sr = librosa.load(src_path, sr=None, mono=True)
+        wav, sr = sf.read(str(src_path), dtype="float32", always_2d=False)
+        if wav.ndim > 1:
+            wav = np.mean(wav, axis=1)
         if trim_silence:
-            wav, _ = librosa.effects.trim(wav, top_db=28)
+            wav = fast_trim_silence(wav, sr, top_db=28.0)
         if abs(speed - 1.0) >= 0.02:
             wav = librosa.effects.time_stretch(wav, rate=float(speed))
         sf.write(str(dst_path), wav, sr, subtype="PCM_16")
@@ -973,23 +1042,59 @@ def refresh_all(current_out_dir: str):
     )
 
 
-def save_new_sample(uploaded_file, custom_name):
+def on_upload_new_file(uploaded_file, current_name: str):
     if not uploaded_file:
-        return gr.update(), gr.update(), "", "", "오디오 파일을 먼저 선택하세요."
+        return gr.update()
+    if current_name and current_name.strip():
+        return gr.update()
+    return Path(uploaded_file).stem
+
+
+def save_ref_text_on_edit(voice_name: str, ref_text: str):
+    if not voice_name or voice_name.startswith("("):
+        return gr.update()
+    clean_ref = (ref_text or "").strip()
+    if not clean_ref:
+        return gr.update()
+    audio_path = find_sample_path(voice_name)
+    for d in (G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR):
+        try:
+            if d.exists():
+                (d / f"{audio_path.stem}.txt").write_text(clean_ref, encoding="utf-8")
+        except Exception:
+            pass
+    return f"샘플 대사 자동 저장됨 · {audio_path.stem}.txt"
+
+
+def save_new_sample(uploaded_file, custom_name, ref_text_input=""):
+    if not uploaded_file:
+        return gr.update(), gr.update(), gr.update(), "", "오디오 파일을 먼저 업로드하세요."
     src = Path(uploaded_file)
     stem = re.sub(r'[\\/:*?"<>|]', "_", custom_name.strip()) if custom_name and custom_name.strip() else src.stem
-    filename = f"{stem}{src.suffix.lower()}"
+    filename = f"{stem}.wav"
     dst_local = LOCAL_SAMPLE_DIR / filename
-    shutil.copy2(src, dst_local)
     try:
-        shutil.copy2(src, G_DRIVE_SAMPLE_DIR / filename)
+        wav, sr = librosa.load(str(src), sr=44100, mono=True)
+        sf.write(str(dst_local), wav, sr, subtype="PCM_16")
+    except Exception:
+        filename = f"{stem}{src.suffix.lower()}"
+        dst_local = LOCAL_SAMPLE_DIR / filename
+        shutil.copy2(src, dst_local)
+    try:
+        shutil.copy2(dst_local, G_DRIVE_SAMPLE_DIR / filename)
     except Exception:
         pass
-    ref_text = auto_recognize_text(dst_local)
+    ref_text = (ref_text_input or "").strip() or auto_recognize_text(dst_local)
+    if ref_text:
+        for d in (G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR):
+            try:
+                (d / f"{dst_local.stem}.txt").write_text(ref_text, encoding="utf-8")
+            except Exception:
+                pass
     choices = get_sample_files()
     return (
         gr.update(choices=choices, value=filename),
-        render_audio_html(dst_local, "샘플", autoplay=False),
+        render_audio_html(dst_local, "보이스 샘플", autoplay=False),
         ref_text,
         str(dst_local),
         f"새 목소리 등록 완료 · {filename}",
@@ -1000,6 +1105,144 @@ def request_cancel():
     global _CANCEL_REQUESTED
     _CANCEL_REQUESTED = True
     return "합성 중단됨"
+
+
+def split_script_into_chunks(text: str, max_chars: int = 85) -> list[str]:
+    clean = (text or "").strip()
+    if not clean:
+        return []
+    if len(clean) <= max_chars and "\n" not in clean:
+        return [clean]
+    raw_parts = [p.strip() for p in re.split(r"(?<=[.?!。？！])\s+|\n+", clean) if p.strip()]
+    chunks: list[str] = []
+    cur = ""
+    for part in raw_parts:
+        if len(part) > max_chars:
+            sub_parts = [s.strip() for s in re.split(r"(?<=[,，;；])\s+", part) if s.strip()]
+        else:
+            sub_parts = [part]
+        for sub in sub_parts:
+            if not cur:
+                cur = sub
+            elif len(cur) + 1 + len(sub) <= max_chars:
+                cur = f"{cur} {sub}"
+            else:
+                chunks.append(cur)
+                cur = sub
+    if cur:
+        chunks.append(cur)
+    return chunks if chunks else [clean]
+
+
+def _synthesize_single_chunk(
+    chunk_text: str,
+    voice_name: str,
+    trimmed_path: Path,
+    clean_ref: str,
+    temp_val: float,
+    engines: list[str],
+    colab_url_input: str,
+    engine_choice: str,
+) -> tuple[Optional[Path], str, list[str]]:
+    cache_wav = _get_synth_cache_path(trimmed_path, clean_ref, chunk_text, temp_val)
+    if cache_wav.exists() and cache_wav.stat().st_size > 1000:
+        return cache_wav, "캐시 즉시 로드", []
+
+    errors: list[str] = []
+    tmp_out: Optional[Path] = None
+    try:
+        for eng in engines:
+            if _CANCEL_REQUESTED:
+                return None, "", ["중단됨"]
+            try:
+                if eng == "colab":
+                    active_colab_url = get_colab_url(colab_url_input, force_refresh=not bool(_LAST_COLAB_CHECK["url"]))
+                    if not active_colab_url:
+                        active_colab_url = get_colab_url(colab_url_input, force_refresh=True)
+                    if not active_colab_url:
+                        if engine_choice == "코랩 GPU":
+                            return None, "", ["연결된 코랩이 없습니다. '자동' 또는 '내 PC'를 선택하세요."]
+                        errors.append("코랩 오프라인 -> 내 PC 전환")
+                        continue
+
+                    c_colab = get_colab_client(active_colab_url)
+                    upload_arg = None if voice_name == DEFAULT_VOICE_NAME else handle_file(str(trimmed_path))
+                    try:
+                        res = c_colab.predict(
+                            voice_name,
+                            upload_arg,
+                            clean_ref,
+                            chunk_text,
+                            float(temp_val),
+                            0.6,
+                            1.2,
+                            api_name="/generate_tts",
+                        )
+                    except Exception:
+                        res = c_colab.predict(
+                            unicodedata.normalize("NFD", voice_name),
+                            handle_file(str(trimmed_path)),
+                            clean_ref,
+                            chunk_text,
+                            float(temp_val),
+                            0.6,
+                            1.2,
+                            api_name="/generate_tts",
+                        )
+                    res_audio = res[0] if isinstance(res, (list, tuple)) else res
+                    if isinstance(res_audio, dict) and "path" in res_audio:
+                        res_audio = res_audio["path"]
+                    if res_audio and os.path.exists(str(res_audio)):
+                        shutil.copy2(str(res_audio), cache_wav)
+                        return cache_wav, "코랩 GPU", errors
+                    elif isinstance(res, (list, tuple)) and len(res) >= 3 and "base64," in str(res[2]):
+                        m_b64 = re.search(r"base64,([A-Za-z0-9+/=]+)", str(res[2]))
+                        if m_b64:
+                            cache_wav.write_bytes(base64.b64decode(m_b64.group(1)))
+                            return cache_wav, "코랩 GPU", errors
+
+                elif eng == "local_fish":
+                    if str(FISH_ROOT) not in sys.path:
+                        sys.path.insert(0, str(FISH_ROOT))
+                    import torch
+                    from fish_speech.utils.schema import ServeTTSRequest, ServeReferenceAudio
+
+                    engine = get_local_fish_engine()
+                    ref_bytes = get_reference_wav_bytes(trimmed_path)
+                    dynamic_max_tokens = min(512, max(96, int(len(chunk_text) * 6.5) + 48))
+
+                    torch.manual_seed(42)
+                    req = ServeTTSRequest(
+                        text=chunk_text,
+                        references=[ServeReferenceAudio(audio=ref_bytes, text=clean_ref)],
+                        max_new_tokens=dynamic_max_tokens,
+                        chunk_length=200,
+                        top_p=0.6,
+                        repetition_penalty=1.2,
+                        temperature=float(temp_val),
+                        format="wav",
+                        use_memory_cache="on",
+                        seed=42,
+                    )
+                    for result in engine.inference(req):
+                        if _CANCEL_REQUESTED:
+                            return None, "", ["중단됨"]
+                        if result.code == "final":
+                            sr, wav_data = result.audio
+                            sf.write(str(cache_wav), wav_data, sr, subtype="PCM_16")
+                            return cache_wav, "내 PC", errors
+                        elif result.code == "error":
+                            errors.append(f"local_fish: {result.error}")
+                            break
+            except Exception as e:
+                errors.append(f"{eng}: {e}")
+    finally:
+        if tmp_out and tmp_out.exists():
+            try:
+                tmp_out.unlink()
+            except Exception:
+                pass
+    return None, "", errors
 
 
 def generate_cloned_voice(
@@ -1048,6 +1291,7 @@ def generate_cloned_voice(
 
     trimmed_path = prepare_10s_wav(audio_path)
     target_clean = target_text.strip()
+    chunks = split_script_into_chunks(target_clean, max_chars=85)
 
     if engine_choice == "코랩 GPU":
         engines = ["colab"]
@@ -1056,151 +1300,104 @@ def generate_cloned_voice(
     else:
         engines = ["colab", "local_fish"]
 
-    out_audio_tmp = None
-    cleanup_tmp_file: Optional[Path] = None
-    used_engine = ""
-    errors = []
+    combined_wavs: list[np.ndarray] = []
+    sr_final = 44100
+    used_engines: list[str] = []
 
-    try:
-        for eng in engines:
-            if _CANCEL_REQUESTED:
-                yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
-                return
-
-            try:
-                if eng == "colab":
-                    active_colab_url = get_colab_url(colab_url_input, force_refresh=not bool(_LAST_COLAB_CHECK["url"]))
-                    if not active_colab_url:
-                        active_colab_url = get_colab_url(colab_url_input, force_refresh=True)
-                    if not active_colab_url:
-                        if engine_choice == "코랩 GPU":
-                            yield gr.update(), "", "연결된 코랩이 없습니다. '자동' 또는 '내 PC'를 선택하세요.", get_saved_files_table(str(out_dir))
-                            return
-                        errors.append("코랩 오프라인 -> 내 PC 전환")
-                        continue
-
-                    yield gr.update(), "", "코랩 GPU에서 합성 중...", get_saved_files_table(str(out_dir))
-                    c_colab = get_colab_client(active_colab_url)
-                    upload_arg = None if voice_name == DEFAULT_VOICE_NAME else handle_file(str(trimmed_path))
-                    try:
-                        res = c_colab.predict(
-                            voice_name,
-                            upload_arg,
-                            clean_ref,
-                            target_clean,
-                            float(temp_val),
-                            0.6,
-                            1.2,
-                            api_name="/generate_tts",
-                        )
-                    except Exception:
-                        res = c_colab.predict(
-                            unicodedata.normalize("NFD", voice_name),
-                            handle_file(str(trimmed_path)),
-                            clean_ref,
-                            target_clean,
-                            float(temp_val),
-                            0.6,
-                            1.2,
-                            api_name="/generate_tts",
-                        )
-                    res_audio = res[0] if isinstance(res, (list, tuple)) else res
-                    if isinstance(res_audio, dict) and "path" in res_audio:
-                        res_audio = res_audio["path"]
-                    if res_audio and os.path.exists(str(res_audio)):
-                        out_audio_tmp = str(res_audio)
-                        used_engine = "코랩 GPU"
-                        break
-                    elif isinstance(res, (list, tuple)) and len(res) >= 3 and "base64," in str(res[2]):
-                        m_b64 = re.search(r"base64,([A-Za-z0-9+/=]+)", str(res[2]))
-                        if m_b64:
-                            cleanup_tmp_file = Path(os.environ.get("TEMP", ".")) / f"colab_b64_{os.getpid()}.wav"
-                            cleanup_tmp_file.write_bytes(base64.b64decode(m_b64.group(1)))
-                            out_audio_tmp = str(cleanup_tmp_file)
-                            used_engine = "코랩 GPU"
-                            break
-
-                elif eng == "local_fish":
-                    yield gr.update(), "", "내 PC 엔진에서 합성 중...", get_saved_files_table(str(out_dir))
-                    if str(FISH_ROOT) not in sys.path:
-                        sys.path.insert(0, str(FISH_ROOT))
-                    import torch
-                    from fish_speech.utils.schema import ServeTTSRequest, ServeReferenceAudio
-
-                    engine = get_local_fish_engine()
-                    ref_bytes = get_reference_wav_bytes(trimmed_path)
-                    dynamic_max_tokens = min(512, max(96, int(len(target_clean) * 6.5) + 48))
-
-                    torch.manual_seed(42)
-                    req = ServeTTSRequest(
-                        text=target_clean,
-                        references=[ServeReferenceAudio(audio=ref_bytes, text=clean_ref)],
-                        max_new_tokens=dynamic_max_tokens,
-                        chunk_length=200,
-                        top_p=0.6,
-                        repetition_penalty=1.2,
-                        temperature=float(temp_val),
-                        format="wav",
-                        use_memory_cache="on",
-                        seed=42,
-                    )
-                    for result in engine.inference(req):
-                        if _CANCEL_REQUESTED:
-                            yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
-                            return
-                        if result.code == "final":
-                            sr, wav_data = result.audio
-                            cleanup_tmp_file = Path(os.environ.get("TEMP", ".")) / f"local_fish_out_{os.getpid()}.wav"
-                            sf.write(str(cleanup_tmp_file), wav_data, sr, subtype="PCM_16")
-                            out_audio_tmp = str(cleanup_tmp_file)
-                            used_engine = "내 PC"
-                            break
-                        elif result.code == "error":
-                            errors.append(f"local_fish: {result.error}")
-                            break
-                    if out_audio_tmp:
-                        break
-            except Exception as e:
-                errors.append(f"{eng}: {e}")
-
+    for idx, chunk_str in enumerate(chunks, start=1):
         if _CANCEL_REQUESTED:
             yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
             return
 
-        if not out_audio_tmp or not os.path.exists(out_audio_tmp):
-            yield gr.update(), "", "합성 실패 · " + " / ".join(errors), get_saved_files_table(str(out_dir))
+        if len(chunks) > 1:
+            yield gr.update(), "", f"음성 합성 중 ({idx}/{len(chunks)} 문장) · {chunk_str[:22]}...", get_saved_files_table(str(out_dir))
+        else:
+            cache_probe = _get_synth_cache_path(trimmed_path, clean_ref, chunk_str, float(temp_val))
+            if not cache_probe.exists():
+                yield gr.update(), "", "음성 합성 중...", get_saved_files_table(str(out_dir))
+
+        chunk_wav_path, used_eng, errs = _synthesize_single_chunk(
+            chunk_str,
+            voice_name,
+            trimmed_path,
+            clean_ref,
+            float(temp_val),
+            engines,
+            colab_url_input,
+            engine_choice,
+        )
+        if _CANCEL_REQUESTED:
+            yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
+            return
+        if not chunk_wav_path or not chunk_wav_path.exists():
+            yield gr.update(), "", "합성 실패 · " + " / ".join(errs), get_saved_files_table(str(out_dir))
             return
 
-        now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        preview_slug = re.sub(r"[^가-힣a-zA-Z0-9]", "", target_clean)[:12] or "tts"
-        voice_slug = re.sub(r"[^가-힣a-zA-Z0-9_-]", "", audio_path.stem)[:14] or "voice"
-        prefix_clean = re.sub(r'[\\/:*?"<>| ]', "_", (custom_prefix or "").strip())
-        out_filename = f"{prefix_clean}_{now_str}_{preview_slug}.wav" if prefix_clean else f"{now_str}_{voice_slug}_{preview_slug}.wav"
+        if used_eng and used_eng not in used_engines:
+            used_engines.append(used_eng)
 
-        final_path = out_dir / out_filename
-        save_processed_audio(out_audio_tmp, final_path, float(speed_val), bool(trim_val))
+        wav_part, sr_part = sf.read(str(chunk_wav_path), dtype="float32", always_2d=False)
+        if wav_part.ndim > 1:
+            wav_part = np.mean(wav_part, axis=1)
+        sr_final = sr_part
+        if bool(trim_val) and len(chunks) > 1:
+            wav_part = fast_trim_silence(wav_part, sr_final, top_db=28.0)
+        combined_wavs.append(wav_part)
+        if idx < len(chunks):
+            combined_wavs.append(np.zeros(int(sr_final * 0.18), dtype=np.float32))
 
+    full_raw_wav = np.concatenate(combined_wavs) if len(combined_wavs) > 1 else combined_wavs[0]
+    sf.write(str(LAST_RAW_WAV), full_raw_wav, sr_final, subtype="PCM_16")
+
+    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    preview_slug = re.sub(r"[^가-힣a-zA-Z0-9]", "", target_clean)[:12] or "tts"
+    voice_slug = re.sub(r"[^가-힣a-zA-Z0-9_-]", "", audio_path.stem)[:14] or "voice"
+    prefix_clean = re.sub(r'[\\/:*?"<>| ]', "_", (custom_prefix or "").strip())
+    out_filename = f"{prefix_clean}_{now_str}_{preview_slug}.wav" if prefix_clean else f"{now_str}_{voice_slug}_{preview_slug}.wav"
+
+    final_path = out_dir / out_filename
+    save_processed_audio(str(LAST_RAW_WAV), final_path, float(speed_val), bool(trim_val))
+
+    if load_settings().get("also_save_gdrive", True):
+        try:
+            if out_dir.resolve() != G_DRIVE_OUT_DIR.resolve():
+                G_DRIVE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(final_path, G_DRIVE_OUT_DIR / out_filename)
+        except Exception:
+            pass
+
+    elapsed = time.time() - t_start
+    eng_summary = " · ".join(used_engines) if used_engines else "엔진"
+    yield (
+        render_audio_html(final_path, "완성", autoplay=True),
+        str(final_path),
+        f"합성 완료 ({elapsed:.2f}초 · {eng_summary}) · {out_filename}",
+        get_saved_files_table(str(out_dir)),
+    )
+
+
+def apply_live_postprocess(speed_val, trim_val, current_out_path: str, current_out_dir: str):
+    """배속 슬라이더나 무음 제거 체크박스 변경 시 재합성 없이 0.03초 만에 즉시 반영"""
+    if not current_out_path or not os.path.exists(current_out_path):
+        return gr.update(), gr.update(), gr.update()
+    src_raw = LAST_RAW_WAV if LAST_RAW_WAV.exists() else Path(current_out_path)
+    dst_path = Path(current_out_path)
+    try:
+        save_processed_audio(str(src_raw), dst_path, float(speed_val), bool(trim_val))
         if load_settings().get("also_save_gdrive", True):
             try:
-                if out_dir.resolve() != G_DRIVE_OUT_DIR.resolve():
-                    G_DRIVE_OUT_DIR.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(final_path, G_DRIVE_OUT_DIR / out_filename)
+                if dst_path.parent.resolve() != G_DRIVE_OUT_DIR.resolve():
+                    shutil.copy2(dst_path, G_DRIVE_OUT_DIR / dst_path.name)
             except Exception:
                 pass
-
-        elapsed = time.time() - t_start
-        yield (
-            render_audio_html(final_path, "완성", autoplay=True),
-            str(final_path),
-            f"합성 완료 ({elapsed:.1f}초 · {used_engine}) · {out_filename}",
-            get_saved_files_table(str(out_dir)),
+        trim_label = "무음제거 ON" if bool(trim_val) else "무음제거 OFF"
+        return (
+            render_audio_html(dst_path, "완성", autoplay=True),
+            get_saved_files_table(current_out_dir),
+            f"즉시 적용됨 (배속 {float(speed_val):.2f}x · {trim_label}) · {dst_path.name}",
         )
-    finally:
-        if cleanup_tmp_file and cleanup_tmp_file.exists():
-            try:
-                cleanup_tmp_file.unlink()
-            except Exception:
-                pass
+    except Exception as e:
+        return gr.update(), gr.update(), f"후처리 적용 실패: {e}"
 
 
 def open_selected_output_folder(out_dir_str: str, latest_file_str: str = ""):
@@ -1228,6 +1425,16 @@ FORCE_LIGHT_JS = """
         document.body.style.colorScheme = 'light';
     }
     document.documentElement.style.colorScheme = 'light';
+    window.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            const btn = document.querySelector('button.primary');
+            if (btn) {
+                e.preventDefault();
+                e.stopPropagation();
+                btn.click();
+            }
+        }
+    }, true);
 }
 """
 
@@ -1539,10 +1746,11 @@ button.secondary *, button.stop * { color: #18181B !important; }
 button.secondary:hover, button.stop:hover { background: #E4E4E7 !important; color: #09090B !important; }
 .main-stop-btn { min-height: 44px !important; border-radius: 11px !important; }
 
-.status-toast textarea, .status-toast input {
+.status-toast textarea, .status-toast input, .status-toast textarea:disabled, .status-toast input:disabled {
     background: #F4F4F5 !important; border: 1px solid #E4E4E7 !important; border-radius: 9px !important;
     padding: 8px 12px !important; height: 36px !important; min-height: 36px !important; max-height: 36px !important;
     font-size: 12.5px !important; font-weight: 600 !important; color: #18181B !important;
+    opacity: 1 !important; -webkit-text-fill-color: #18181B !important;
 }
 
 .gradio-accordion, .accordion {
@@ -1654,11 +1862,11 @@ with gr.Blocks(title="Voice Studio") as demo:
 
         # 우측: 대본 입력 & 결과 오디오
         with gr.Column(scale=7, elem_classes="studio-card"):
-            gr.HTML('<div class="section-heading"><span>03 · 음성 합성</span></div>')
+            gr.HTML('<div class="section-heading"><span>03 · 음성 합성</span><span style="font-size:11.5px;color:#71717A;font-weight:500;">Ctrl+Enter 바로 시작</span></div>')
             target_text_box = gr.Textbox(
                 value="안녕하세요. 테스트 음성입니다.",
                 lines=2,
-                placeholder="읽힐 대본을 입력하세요.",
+                placeholder="읽힐 대본을 입력하세요 (여러 문장 입력 시 자동 분할 합성).",
                 show_label=False,
                 container=False,
                 elem_classes="script-editor",
@@ -1723,6 +1931,18 @@ with gr.Blocks(title="Voice Studio") as demo:
         outputs=[sample_audio_html, ref_text_box, sample_path_state],
         queue=False,
     )
+    ref_text_box.blur(
+        fn=save_ref_text_on_edit,
+        inputs=[voice_dropdown, ref_text_box],
+        outputs=[status_box],
+        queue=False,
+    )
+    new_upload.upload(
+        fn=on_upload_new_file,
+        inputs=[new_upload, new_name],
+        outputs=[new_name],
+        queue=False,
+    )
     folder_preset_radio.change(
         fn=set_preset_folder,
         inputs=[folder_preset_radio],
@@ -1763,8 +1983,20 @@ with gr.Blocks(title="Voice Studio") as demo:
     colab_kill_btn.click(fn=shutdown_remote_colab, inputs=[colab_url_box], outputs=[colab_status_txt, status_box], queue=False)
     save_sample_btn.click(
         fn=save_new_sample,
-        inputs=[new_upload, new_name],
+        inputs=[new_upload, new_name, ref_text_box],
         outputs=[voice_dropdown, sample_audio_html, ref_text_box, sample_path_state, status_box],
+        queue=False,
+    )
+    speed_slider.release(
+        fn=apply_live_postprocess,
+        inputs=[speed_slider, trim_chk, output_path_state, output_dir_box],
+        outputs=[output_audio_html, history_table, status_box],
+        queue=False,
+    )
+    trim_chk.change(
+        fn=apply_live_postprocess,
+        inputs=[speed_slider, trim_chk, output_path_state, output_dir_box],
+        outputs=[output_audio_html, history_table, status_box],
         queue=False,
     )
 
