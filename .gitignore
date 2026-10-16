@@ -1,0 +1,11 @@
+# Local Fish Speech 1.5 engine & 1.2GB model weights
+fish-speech/
+
+# Runtime & user settings
+settings.json
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.DS_Store
+Thumbs.db
