@@ -8,15 +8,23 @@ import wave
 import base64
 import shutil
 import ctypes
+import ctypes.wintypes
+import hashlib
 import threading
 import subprocess
 import unicodedata
+import urllib.error
 import urllib.request
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
+from contextlib import nullcontext
 
 os.environ["EINX_FILTER_TRACEBACK"] = "false"
 
+# ==============================================================================
+# 1. 환경 설정 및 경로 초기화
+# ==============================================================================
 STUDIO_DIR = Path(__file__).resolve().parent
 FISH_ROOT = STUDIO_DIR / "fish-speech"
 CKPT_DIR = FISH_ROOT / "checkpoints" / "fish-speech-1.5"
@@ -30,7 +38,6 @@ import gradio as gr
 from gradio_client import Client, handle_file
 
 SETTINGS_FILE = STUDIO_DIR / "settings.json"
-
 DESKTOP_OUT_DIR = Path.home() / "Desktop" / "TTS_완성본"
 DOWNLOADS_OUT_DIR = Path.home() / "Downloads" / "TTS_완성본"
 G_DRIVE_BASE = next(
@@ -41,7 +48,7 @@ G_DRIVE_SAMPLE_DIR = G_DRIVE_BASE / "샘플목소리"
 G_DRIVE_OUT_DIR = G_DRIVE_BASE / "완성본"
 LOCAL_SAMPLE_DIR = STUDIO_DIR / "샘플목소리"
 
-for _d in [DESKTOP_OUT_DIR, LOCAL_SAMPLE_DIR, G_DRIVE_SAMPLE_DIR, G_DRIVE_OUT_DIR]:
+for _d in (DESKTOP_OUT_DIR, LOCAL_SAMPLE_DIR, G_DRIVE_SAMPLE_DIR, G_DRIVE_OUT_DIR):
     try:
         _d.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -62,29 +69,79 @@ DEFAULT_REF_TEXT = (
     "그러실 때는 타입캐스트를 사용해 보시는 걸 추천드리는데요."
 )
 OLD_SHORT_REF_TEXT = "아 컨텐츠 제작을 위해서 더빙을 해야 되는데 어떻게 진행을 해야 되는지 고민이시군요 고객님."
+COLAB_DIRECT_URL = "https://colab.research.google.com/github/jinPP00/tts_studio/blob/main/fish_tts_studio.ipynb"
+NTFY_TOPIC = "jinpp00_fish_tts_colab_2026"
+AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
 
 _default_wav = LOCAL_SAMPLE_DIR / DEFAULT_VOICE_NAME
 _b64_file = STUDIO_DIR / "sample_voice.b64"
-if (not _default_wav.exists() or _default_wav.stat().st_size < 900000 or _default_wav.stat().st_size > 1200000) and _b64_file.exists():
+if (not _default_wav.exists() or not (900_000 <= _default_wav.stat().st_size <= 1_200_000)) and _b64_file.exists():
     try:
         _default_wav.write_bytes(base64.b64decode(_b64_file.read_bytes()))
-        (LOCAL_SAMPLE_DIR / "recording-2026.-10.-16.-오후-1-19-43.txt").write_text(
-            DEFAULT_REF_TEXT,
-            encoding="utf-8",
-        )
+        (LOCAL_SAMPLE_DIR / f"{_default_wav.stem}.txt").write_text(DEFAULT_REF_TEXT, encoding="utf-8")
     except Exception:
         pass
 
-NTFY_TOPIC = "jinpp00_fish_tts_colab_2026"
-AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
+# ==============================================================================
+# 2. 인메모리 캐시 및 설정 관리 (디스크 I/O 최소화)
+# ==============================================================================
 _LOCAL_FISH_ENGINE = None
 _ENGINE_LOCK = threading.Lock()
 _CANCEL_REQUESTED = False
-_COLAB_CLIENT_CACHE = {}
+_COLAB_CLIENT_CACHE: dict[str, Client] = {}
 _LAST_COLAB_CHECK = {"ts": 0.0, "url": ""}
-_REF_BYTES_CACHE = {}
+_REF_BYTES_CACHE: dict[str, bytes] = {}
+_AUDIO_HTML_CACHE: dict[tuple, str] = {}
+_SETTINGS_MEM_CACHE: dict = {"mtime": -1, "data": {}}
 
 
+def load_settings() -> dict:
+    default_cfg = {
+        "output_dir": str(DESKTOP_OUT_DIR),
+        "also_save_gdrive": True,
+        "colab_url": "",
+    }
+    if SETTINGS_FILE.exists():
+        try:
+            mtime = SETTINGS_FILE.stat().st_mtime_ns
+            if mtime == _SETTINGS_MEM_CACHE["mtime"] and _SETTINGS_MEM_CACHE["data"]:
+                return dict(_SETTINGS_MEM_CACHE["data"])
+            loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            default_cfg.update(loaded)
+            _SETTINGS_MEM_CACHE["mtime"] = mtime
+            _SETTINGS_MEM_CACHE["data"] = dict(default_cfg)
+        except Exception:
+            pass
+    return default_cfg
+
+
+def save_settings(cfg: dict):
+    try:
+        cur = load_settings()
+        if all(cur.get(k) == v for k, v in cfg.items()):
+            return
+        cur.update(cfg)
+        SETTINGS_FILE.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+        _SETTINGS_MEM_CACHE["mtime"] = SETTINGS_FILE.stat().st_mtime_ns
+        _SETTINGS_MEM_CACHE["data"] = dict(cur)
+    except Exception:
+        pass
+
+
+def get_active_output_dir(custom_dir: str = "") -> Path:
+    path_str = (custom_dir or "").strip() or load_settings().get("output_dir", str(DESKTOP_OUT_DIR))
+    p = Path(path_str)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    except Exception:
+        DESKTOP_OUT_DIR.mkdir(parents=True, exist_ok=True)
+        return DESKTOP_OUT_DIR
+
+
+# ==============================================================================
+# 3. Windows 사용자 데스크톱(WinSta0\Default) 및 탐색기 포그라운드 제어
+# ==============================================================================
 class _STARTUPINFOW(ctypes.Structure):
     _fields_ = [
         ("cb", ctypes.wintypes.DWORD),
@@ -118,7 +175,6 @@ class _PROCESS_INFORMATION(ctypes.Structure):
 
 
 def _switch_thread_to_user_desktop():
-    """샌드박스(exebox) 데스크톱에서 실행 중이더라도 실제 사용자 화면(WinSta0\\Default)으로 스레드 전환"""
     if sys.platform == "win32":
         try:
             user32 = ctypes.windll.user32
@@ -131,7 +187,6 @@ def _switch_thread_to_user_desktop():
 
 
 def _create_process_on_user_desktop(cmd_line: str, show_window: int = 5):
-    """프로세스를 숨겨진 샌드박스 데스크톱이 아닌 실제 사용자 화면(WinSta0\\Default)에 직접 실행"""
     if sys.platform != "win32":
         subprocess.Popen(cmd_line, shell=True)
         return
@@ -143,15 +198,17 @@ def _create_process_on_user_desktop(cmd_line: str, show_window: int = 5):
         si.wShowWindow = show_window
         pi = _PROCESS_INFORMATION()
         buf = ctypes.create_unicode_buffer(cmd_line)
-        ctypes.windll.kernel32.CreateProcessW(
+        ok = ctypes.windll.kernel32.CreateProcessW(
             None, buf, None, None, False, 0, None, None, ctypes.byref(si), ctypes.byref(pi)
         )
+        if ok:
+            ctypes.windll.kernel32.CloseHandle(pi.hProcess)
+            ctypes.windll.kernel32.CloseHandle(pi.hThread)
     except Exception:
         subprocess.Popen(cmd_line, shell=True)
 
 
 def unlock_windows_foreground():
-    """백그라운드 파이썬 프로세스에서 탐색기/창을 띄울 때 브라우저 위로 즉시 올라오도록 포그라운드 잠금 해제"""
     if sys.platform == "win32":
         try:
             _switch_thread_to_user_desktop()
@@ -162,134 +219,66 @@ def unlock_windows_foreground():
             pass
 
 
-def pop_explorer_foreground(folder_path: Path, select_file: Path = None):
-    """윈도우 탐색기를 실제 사용자 화면(WinSta0\\Default)의 브라우저 맨 앞으로 즉시 팝업"""
+def pop_explorer_foreground(folder_path: Path, select_file: Optional[Path] = None):
     folder_path.mkdir(parents=True, exist_ok=True)
     unlock_windows_foreground()
-    if sys.platform == "win32":
-        norm_dir = os.path.normpath(str(folder_path.resolve()))
-        if select_file is None:
-            wavs = sorted(
-                [f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTS],
-                key=lambda x: x.stat().st_mtime,
-                reverse=True,
-            )
-            if wavs:
-                select_file = wavs[0]
-
-        if select_file and select_file.exists():
-            norm_file = os.path.normpath(str(select_file.resolve()))
-            cmd_line = f'explorer.exe /select,"{norm_file}"'
-        else:
-            cmd_line = f'explorer.exe "{norm_dir}"'
-
-        _create_process_on_user_desktop(cmd_line, show_window=5)
-
-        folder_name = folder_path.name
-        ps_fg = (
-            f"Start-Sleep -Milliseconds 350; "
-            f"$shell = New-Object -ComObject Shell.Application; "
-            f"foreach ($w in $shell.Windows()) {{ "
-            f"  try {{ "
-            f"    if ($w.LocationName -eq '{folder_name}' -or $w.LocationURL -match [uri]::EscapeDataString('{folder_name}')) {{ "
-            f"      $hwnd = $w.HWND; "
-            f"      Add-Type -Name WinFg -Namespace U32 -MemberDefinition '"
-            f"[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int c); "
-            f"[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h); "
-            f"[DllImport(\"user32.dll\")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f); "
-            f"[DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow(); "
-            f"[DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr p); "
-            f"[DllImport(\"user32.dll\")] public static extern bool AttachThreadInput(uint a, uint b, bool c); "
-            f"[DllImport(\"kernel32.dll\")] public static extern uint GetCurrentThreadId();' -ErrorAction SilentlyContinue; "
-            f"      $fg = [U32.WinFg]::GetForegroundWindow(); "
-            f"      $ft = [U32.WinFg]::GetWindowThreadProcessId($fg, [IntPtr]::Zero); "
-            f"      $ct = [U32.WinFg]::GetCurrentThreadId(); "
-            f"      [U32.WinFg]::AttachThreadInput($ct, $ft, $true) | Out-Null; "
-            f"      [U32.WinFg]::ShowWindow([IntPtr]$hwnd, 9) | Out-Null; "
-            f"      [U32.WinFg]::SetWindowPos([IntPtr]$hwnd, [IntPtr](-1), 0, 0, 0, 0, 3) | Out-Null; "
-            f"      [U32.WinFg]::SetWindowPos([IntPtr]$hwnd, [IntPtr](-2), 0, 0, 0, 0, 3) | Out-Null; "
-            f"      [U32.WinFg]::SetForegroundWindow([IntPtr]$hwnd) | Out-Null; "
-            f"      [U32.WinFg]::AttachThreadInput($ct, $ft, $false) | Out-Null; "
-            f"    }} "
-            f"  }} catch {{}} "
-            f"}}"
-        )
-        _create_process_on_user_desktop(f'powershell.exe -NoProfile -WindowStyle Hidden -Command "{ps_fg}"', show_window=0)
-    else:
+    if sys.platform != "win32":
         os.startfile(str(folder_path))
+        return
+
+    norm_dir = os.path.normpath(str(folder_path.resolve()))
+    if select_file is None:
+        wavs = sorted(
+            (f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTS),
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+        if wavs:
+            select_file = wavs[0]
+
+    if select_file and select_file.exists():
+        norm_file = os.path.normpath(str(select_file.resolve()))
+        cmd_line = f'explorer.exe /select,"{norm_file}"'
+    else:
+        cmd_line = f'explorer.exe "{norm_dir}"'
+
+    _create_process_on_user_desktop(cmd_line, show_window=5)
+
+    folder_name = folder_path.name
+    ps_fg = (
+        f"Start-Sleep -Milliseconds 320; "
+        f"$shell = New-Object -ComObject Shell.Application; "
+        f"foreach ($w in $shell.Windows()) {{ "
+        f"  try {{ "
+        f"    if ($w.LocationName -eq '{folder_name}' -or $w.LocationURL -match [uri]::EscapeDataString('{folder_name}')) {{ "
+        f"      $hwnd = $w.HWND; "
+        f"      Add-Type -Name WinFg -Namespace U32 -MemberDefinition '"
+        f"[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int c); "
+        f"[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h); "
+        f"[DllImport(\"user32.dll\")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f); "
+        f"[DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow(); "
+        f"[DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr p); "
+        f"[DllImport(\"user32.dll\")] public static extern bool AttachThreadInput(uint a, uint b, bool c); "
+        f"[DllImport(\"kernel32.dll\")] public static extern uint GetCurrentThreadId();' -ErrorAction SilentlyContinue; "
+        f"      $fg = [U32.WinFg]::GetForegroundWindow(); "
+        f"      $ft = [U32.WinFg]::GetWindowThreadProcessId($fg, [IntPtr]::Zero); "
+        f"      $ct = [U32.WinFg]::GetCurrentThreadId(); "
+        f"      [U32.WinFg]::AttachThreadInput($ct, $ft, $true) | Out-Null; "
+        f"      [U32.WinFg]::ShowWindow([IntPtr]$hwnd, 9) | Out-Null; "
+        f"      [U32.WinFg]::SetWindowPos([IntPtr]$hwnd, [IntPtr](-1), 0, 0, 0, 0, 3) | Out-Null; "
+        f"      [U32.WinFg]::SetWindowPos([IntPtr]$hwnd, [IntPtr](-2), 0, 0, 0, 0, 3) | Out-Null; "
+        f"      [U32.WinFg]::SetForegroundWindow([IntPtr]$hwnd) | Out-Null; "
+        f"      [U32.WinFg]::AttachThreadInput($ct, $ft, $false) | Out-Null; "
+        f"    }} "
+        f"  }} catch {{}} "
+        f"}}"
+    )
+    _create_process_on_user_desktop(f'powershell.exe -NoProfile -WindowStyle Hidden -Command "{ps_fg}"', show_window=0)
 
 
-def render_audio_html(file_path, label: str = "오디오 미리듣기", autoplay: bool = False) -> str:
-    """세련된 스튜디오 스타일 HTML5 오디오 플레이어 카드 (단일 Base64)"""
-    if not file_path or not os.path.exists(str(file_path)):
-        return f"""
-        <div class="audio-empty-card">
-            <div class="audio-empty-dot"></div>
-            <span>{label} · 대본을 입력하고 생성하거나 아래 목록에서 파일을 선택하세요</span>
-        </div>
-        """
-    try:
-        p = Path(file_path)
-        raw_bytes = p.read_bytes()
-        size_kb = len(raw_bytes) // 1024
-        b64 = base64.b64encode(raw_bytes).decode("ascii")
-        ext = p.suffix.lower().lstrip(".")
-        mime = "audio/mpeg" if ext == "mp3" else ("audio/mp4" if ext == "m4a" else "audio/wav")
-        auto_attr = "autoplay" if autoplay else ""
-        uid = f"audio_{int(time.time() * 1000)}_{os.getpid()}"
-        return f"""
-        <div class="audio-player-card">
-            <div class="audio-card-header">
-                <div class="audio-title-wrap">
-                    <span class="audio-badge">{label}</span>
-                    <span class="audio-filename" title="{p.name}">{p.name}</span>
-                </div>
-                <div class="audio-meta-wrap">
-                    <span class="audio-size">{size_kb} KB</span>
-                    <a href="#" class="audio-dl-btn" onclick="const a=document.createElement('a');a.href=document.getElementById('{uid}').src;a.download='{p.name}';a.click();return false;">저장</a>
-                </div>
-            </div>
-            <audio id="{uid}" controls {auto_attr} preload="auto" class="studio-audio-el" src="data:{mime};base64,{b64}"></audio>
-        </div>
-        """
-    except Exception as e:
-        return f"<div class='audio-empty-card' style='color:#dc2626;'>오디오 로드 실패: {e}</div>"
-
-
-def load_settings() -> dict:
-    default_cfg = {
-        "output_dir": str(DESKTOP_OUT_DIR),
-        "also_save_gdrive": True,
-        "colab_url": "",
-    }
-    if SETTINGS_FILE.exists():
-        try:
-            default_cfg.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
-        except Exception:
-            pass
-    return default_cfg
-
-
-def save_settings(cfg: dict):
-    try:
-        cur = load_settings()
-        cur.update(cfg)
-        SETTINGS_FILE.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def get_active_output_dir(custom_dir: str = "") -> Path:
-    path_str = (custom_dir or "").strip() or load_settings().get("output_dir", str(DESKTOP_OUT_DIR))
-    p = Path(path_str)
-    try:
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-    except Exception:
-        DESKTOP_OUT_DIR.mkdir(parents=True, exist_ok=True)
-        return DESKTOP_OUT_DIR
-
-
+# ==============================================================================
+# 4. 코랩 원격 클러스터 연동 및 상태 관리
+# ==============================================================================
 def is_colab_alive(url: str) -> bool:
     if not url or not url.strip().startswith("http"):
         return False
@@ -305,7 +294,7 @@ def is_colab_alive(url: str) -> bool:
                 return False
         except Exception:
             if attempt == 0:
-                time.sleep(0.3)
+                time.sleep(0.25)
     return False
 
 
@@ -319,7 +308,7 @@ def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> st
             return url
 
     now = time.time()
-    if not force_refresh and _LAST_COLAB_CHECK["url"] and (now - _LAST_COLAB_CHECK["ts"] < 10.0):
+    if not force_refresh and _LAST_COLAB_CHECK["url"] and (now - _LAST_COLAB_CHECK["ts"] < 12.0):
         return _LAST_COLAB_CHECK["url"]
 
     saved = load_settings().get("colab_url", "").strip()
@@ -387,15 +376,78 @@ def get_status_label(force_refresh: bool = False) -> str:
     return render_status_badge("내 PC 단독 모드 (코랩 없이 즉시 생성)", is_online=False)
 
 
+def _send_colab_autorun_keys():
+    if sys.platform != "win32":
+        return
+    try:
+        ps_script = (
+            "$ws = New-Object -ComObject WScript.Shell; "
+            "Start-Sleep -Milliseconds 6500; "
+            "$ws.SendKeys('^{F9}'); "
+            "Start-Sleep -Milliseconds 1500; "
+            "$ws.SendKeys('{TAB}{ENTER}');"
+        )
+        _create_process_on_user_desktop(f'powershell.exe -NoProfile -WindowStyle Hidden -Command "{ps_script}"', show_window=0)
+    except Exception:
+        pass
+
+
+def auto_start_colab_from_pc():
+    already_url = get_colab_url(force_refresh=True)
+    if already_url:
+        short_host = already_url.replace("https://", "").replace("http://", "").split("/")[0]
+        yield render_status_badge(f"코랩 GPU 연결됨 · {short_host}", is_online=True), "이미 코랩 GPU가 연결되어 있습니다."
+        return
+
+    unlock_windows_foreground()
+    _create_process_on_user_desktop(f'cmd.exe /c start "" "{COLAB_DIRECT_URL}"', show_window=0)
+    threading.Thread(target=_send_colab_autorun_keys, daemon=True).start()
+    yield render_status_badge("코랩 GPU 시동 중...", is_online=False), "코랩 자동 시동 중 (기다리지 않고 바로 합성 가능)"
+
+    for sec in range(4, 95, 4):
+        time.sleep(4.0)
+        url = get_colab_url(force_refresh=True)
+        if url:
+            short_host = url.replace("https://", "").replace("http://", "").split("/")[0]
+            yield render_status_badge(f"코랩 GPU 연결됨 · {short_host}", is_online=True), f"코랩 GPU 연결 완료 ({short_host})"
+            return
+        yield render_status_badge(f"코랩 시동 대기 ({sec}초)...", is_online=False), f"코랩 준비 중 ({sec}초) · 지금 바로 합성 가능"
+
+    yield get_status_label(force_refresh=True), "내 PC 엔진 대기 중"
+
+
+def shutdown_remote_colab(colab_url_input: str):
+    url = get_colab_url(colab_url_input, force_refresh=True)
+    if not url:
+        return render_status_badge("내 PC 단독 모드 (코랩 없이 즉시 생성)", is_online=False), "현재 연결된 코랩 세션이 없습니다."
+    try:
+        c = get_colab_client(url)
+        c.predict(api_name="/shutdown_colab")
+    except Exception:
+        pass
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(f"https://ntfy.sh/{NTFY_TOPIC}", data=b"RESET_OLD_COLAB", method="POST"),
+            timeout=3,
+        )
+    except Exception:
+        pass
+    save_settings({"colab_url": ""})
+    _LAST_COLAB_CHECK["url"] = ""
+    _LAST_COLAB_CHECK["ts"] = time.time()
+    return render_status_badge("내 PC 단독 모드 (코랩 없이 즉시 생성)", is_online=False), "코랩 GPU 세션을 안전하게 반납(종료)했습니다."
+
+
+# ==============================================================================
+# 5. 로컬 Fish Speech 1.5 엔진 및 무손실 KV-Cache 고속화 패치
+# ==============================================================================
 def apply_fish_speed_patch():
-    """Fish Speech 1.5 KV-Cache 슬라이싱 패치 (음성 품질/샘플링 확률 분포는 원본 100% 유지)"""
+    """Fish Speech 1.5 KV-Cache 슬라이싱 및 토큰 범위 캐싱 (샘플링 확률 분포는 원본 100% 유지)"""
     try:
         import torch
         from torch import Tensor
-        from typing import Optional
         import torch.nn.functional as F
         import fish_speech.models.text2semantic.llama as llama_mod
-        from contextlib import nullcontext
         import fish_speech.utils.context as ctx_mod
 
         def _fast_autocast_exclude_mps(device_type: str, dtype: torch.dtype):
@@ -492,7 +544,7 @@ def ensure_local_fish_installed():
         _fp = FISH_ROOT / "fish_speech" / "utils" / "file.py"
         if _fp.exists():
             _fp.write_text(_fp.read_text(encoding="utf-8").replace("from natsort import natsorted", "natsorted = sorted"), encoding="utf-8")
-        for _rel in ["fish_speech/models/text2semantic/inference.py", "fish_speech/models/text2semantic/llama.py"]:
+        for _rel in ("fish_speech/models/text2semantic/inference.py", "fish_speech/models/text2semantic/llama.py"):
             _p = FISH_ROOT / _rel
             if _p.exists():
                 _p.write_text(_p.read_text(encoding="utf-8").replace("from transformers import AutoTokenizer", "AutoTokenizer = None"), encoding="utf-8")
@@ -500,10 +552,10 @@ def ensure_local_fish_installed():
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     hf_base = "https://huggingface.co/fishaudio/fish-speech-1.5/resolve/main"
     ms_base = "https://www.modelscope.cn/models/fishaudio/fish-speech-1.5/resolve/master"
-    for fname in ["config.json", "special_tokens.json", "tokenizer.tiktoken", "firefly-gan-vq-fsq-8x1024-21hz-generator.pth", "model.pth"]:
+    for fname in ("config.json", "special_tokens.json", "tokenizer.tiktoken", "firefly-gan-vq-fsq-8x1024-21hz-generator.pth", "model.pth"):
         fpath = CKPT_DIR / fname
         if not fpath.exists() or fpath.stat().st_size < 500:
-            for base in [hf_base, ms_base]:
+            for base in (hf_base, ms_base):
                 try:
                     req = urllib.request.Request(f"{base}/{fname}", headers={"User-Agent": "Mozilla/5.0"})
                     with urllib.request.urlopen(req, timeout=60) as r, open(fpath, "wb") as out_f:
@@ -524,13 +576,12 @@ def get_local_fish_engine():
             return _LOCAL_FISH_ENGINE
 
         model_file = CKPT_DIR / "model.pth"
-        if not model_file.exists() or model_file.stat().st_size < 1200000000:
+        if not model_file.exists() or model_file.stat().st_size < 1_200_000_000:
             ensure_local_fish_installed()
 
         if str(FISH_ROOT) not in sys.path:
             sys.path.insert(0, str(FISH_ROOT))
 
-        import hashlib
         import torch
         try:
             torch.set_num_threads(max(4, (os.cpu_count() or 8) // 2))
@@ -615,10 +666,13 @@ def get_reference_wav_bytes(audio_path: Path) -> bytes:
 
 
 def _prewarm_engine_background():
-    """스튜디오 시작 시 백그라운드에서 로컬 엔진 및 기본 샘플 VQ 특징을 미리 메모리에 적재"""
+    """스튜디오 시작 시 백그라운드에서 코랩 상태 확인 및 로컬 엔진/샘플 VQ 특징 선제 적재"""
     try:
-        model_file = CKPT_DIR / "model.pth"
-        if not model_file.exists():
+        get_colab_url(force_refresh=True)
+    except Exception:
+        pass
+    try:
+        if not (CKPT_DIR / "model.pth").exists():
             return
         eng = get_local_fish_engine()
         sample_p = find_sample_path(DEFAULT_VOICE_NAME)
@@ -631,31 +685,83 @@ def _prewarm_engine_background():
         pass
 
 
+# ==============================================================================
+# 6. 오디오 처리, 샘플 관리 및 음성 합성 파이프라인
+# ==============================================================================
+def render_audio_html(file_path, label: str = "오디오 미리듣기", autoplay: bool = False) -> str:
+    if not file_path or not os.path.exists(str(file_path)):
+        return f"""
+        <div class="audio-empty-card">
+            <div class="audio-empty-dot"></div>
+            <span>{label} · 대본을 입력하고 생성하거나 아래 목록에서 파일을 선택하세요</span>
+        </div>
+        """
+    try:
+        p = Path(file_path)
+        st = p.stat()
+        cache_key = (str(p.resolve()), st.st_mtime_ns, st.st_size, label, autoplay)
+        if not autoplay and cache_key in _AUDIO_HTML_CACHE:
+            return _AUDIO_HTML_CACHE[cache_key]
+
+        raw_bytes = p.read_bytes()
+        size_kb = len(raw_bytes) // 1024
+        b64 = base64.b64encode(raw_bytes).decode("ascii")
+        ext = p.suffix.lower().lstrip(".")
+        mime = "audio/mpeg" if ext == "mp3" else ("audio/mp4" if ext == "m4a" else "audio/wav")
+        auto_attr = "autoplay" if autoplay else ""
+        uid = f"audio_{int(time.time() * 1000)}_{os.getpid()}"
+        html = f"""
+        <div class="audio-player-card">
+            <div class="audio-card-header">
+                <div class="audio-title-wrap">
+                    <span class="audio-badge">{label}</span>
+                    <span class="audio-filename" title="{p.name}">{p.name}</span>
+                </div>
+                <div class="audio-meta-wrap">
+                    <span class="audio-size">{size_kb} KB</span>
+                    <a href="#" class="audio-dl-btn" onclick="const a=document.createElement('a');a.href=document.getElementById('{uid}').src;a.download='{p.name}';a.click();return false;">저장</a>
+                </div>
+            </div>
+            <audio id="{uid}" controls {auto_attr} preload="auto" class="studio-audio-el" src="data:{mime};base64,{b64}"></audio>
+        </div>
+        """
+        if not autoplay:
+            if len(_AUDIO_HTML_CACHE) > 24:
+                _AUDIO_HTML_CACHE.clear()
+            _AUDIO_HTML_CACHE[cache_key] = html
+        return html
+    except Exception as e:
+        return f"<div class='audio-empty-card' style='color:#dc2626;'>오디오 로드 실패: {e}</div>"
+
+
 def prepare_10s_wav(audio_path: Path) -> Path:
-    if audio_path.suffix.lower() == ".wav":
-        try:
-            with wave.open(str(audio_path), "rb") as w:
-                n_channels = w.getnchannels()
-                sampwidth = w.getsampwidth()
-                sr = w.getframerate()
-                n_frames = w.getnframes()
-                if (n_frames / float(sr)) <= 13.0:
-                    return audio_path
-                raw = w.readframes(int(12.5 * sr))
-            trimmed_path = Path(os.environ.get("TEMP", ".")) / f"trimmed_{audio_path.stem}.wav"
-            with wave.open(str(trimmed_path), "wb") as w_out:
-                w_out.setnchannels(n_channels)
-                w_out.setsampwidth(sampwidth)
-                w_out.setframerate(sr)
-                w_out.writeframes(raw)
+    if audio_path.suffix.lower() != ".wav":
+        return audio_path
+    try:
+        with wave.open(str(audio_path), "rb") as w:
+            sr = w.getframerate()
+            if (w.getnframes() / float(sr)) <= 13.0:
+                return audio_path
+            n_channels = w.getnchannels()
+            sampwidth = w.getsampwidth()
+            raw = w.readframes(int(12.5 * sr))
+
+        trimmed_path = Path(os.environ.get("TEMP", ".")) / f"trimmed_{audio_path.stem}.wav"
+        if trimmed_path.exists() and trimmed_path.stat().st_mtime_ns >= audio_path.stat().st_mtime_ns:
             return trimmed_path
-        except Exception:
-            return audio_path
-    return audio_path
+
+        with wave.open(str(trimmed_path), "wb") as w_out:
+            w_out.setnchannels(n_channels)
+            w_out.setsampwidth(sampwidth)
+            w_out.setframerate(sr)
+            w_out.writeframes(raw)
+        return trimmed_path
+    except Exception:
+        return audio_path
 
 
 def find_sample_path(voice_name: str) -> Path:
-    for d in [G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR]:
+    for d in (G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR):
         p = d / voice_name
         if p.exists():
             return p
@@ -664,14 +770,14 @@ def find_sample_path(voice_name: str) -> Path:
 
 def auto_recognize_text(audio_path: Path) -> str:
     if audio_path.name == DEFAULT_VOICE_NAME:
-        for d in [G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR]:
+        for d in (G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR):
             txt_path = d / f"{audio_path.stem}.txt"
             if txt_path.exists():
                 content = txt_path.read_text(encoding="utf-8").strip()
                 if content and content != OLD_SHORT_REF_TEXT and not content.endswith(","):
                     return content
         return DEFAULT_REF_TEXT
-    for d in [G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR]:
+    for d in (G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR):
         txt_path = d / f"{audio_path.stem}.txt"
         if txt_path.exists():
             content = txt_path.read_text(encoding="utf-8").strip()
@@ -680,9 +786,9 @@ def auto_recognize_text(audio_path: Path) -> str:
     return ""
 
 
-def get_sample_files():
+def get_sample_files() -> list[str]:
     seen = {}
-    for d in [G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR]:
+    for d in (G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR):
         if d.exists():
             for f in d.iterdir():
                 if f.is_file() and f.suffix.lower() in AUDIO_EXTS:
@@ -691,7 +797,7 @@ def get_sample_files():
     return files if files else ["(샘플 파일 없음)"]
 
 
-def on_voice_select(voice_name):
+def on_voice_select(voice_name: str):
     if not voice_name or voice_name.startswith("("):
         return render_audio_html(None, "보이스 샘플"), "", ""
     audio_path = find_sample_path(voice_name)
@@ -704,12 +810,12 @@ def on_voice_select(voice_name):
     )
 
 
-def get_saved_files_table(out_dir_str: str = ""):
+def get_saved_files_table(out_dir_str: str = "") -> list[list[str]]:
     out_dir = get_active_output_dir(out_dir_str)
     rows = []
     if out_dir.exists():
         wavs = sorted(
-            [f for f in out_dir.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTS],
+            (f for f in out_dir.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTS),
             key=lambda x: x.stat().st_mtime,
             reverse=True,
         )
@@ -748,20 +854,20 @@ def on_history_select(evt: gr.SelectData, table_data, current_out_dir: str = "")
     return gr.update(), gr.update(), gr.update()
 
 
-def postprocess_audio(audio_path: str, speed: float, trim_silence: bool) -> str:
+def save_processed_audio(src_path: str, dst_path: Path, speed: float, trim_silence: bool):
+    """후처리(무음 제거 · 배속 조절) 후 임시 파일 복사 없이 최종 경로에 직접 저장"""
     try:
         if abs(speed - 1.0) < 0.02 and not trim_silence:
-            return audio_path
-        wav, sr = librosa.load(audio_path, sr=None, mono=True)
+            shutil.copy2(src_path, dst_path)
+            return
+        wav, sr = librosa.load(src_path, sr=None, mono=True)
         if trim_silence:
             wav, _ = librosa.effects.trim(wav, top_db=28)
         if abs(speed - 1.0) >= 0.02:
             wav = librosa.effects.time_stretch(wav, rate=float(speed))
-        out_tmp = Path(os.environ.get("TEMP", ".")) / f"post_{int(time.time()*1000)}.wav"
-        sf.write(str(out_tmp), wav, sr)
-        return str(out_tmp)
+        sf.write(str(dst_path), wav, sr, subtype="PCM_16")
     except Exception:
-        return audio_path
+        shutil.copy2(src_path, dst_path)
 
 
 def set_preset_folder(preset_name: str):
@@ -890,7 +996,7 @@ def generate_cloned_voice(
     elif not clean_ref or clean_ref.endswith(","):
         clean_ref = auto_recognize_text(audio_path)
     else:
-        for d in [G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR]:
+        for d in (G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR):
             try:
                 (d / f"{audio_path.stem}.txt").write_text(clean_ref, encoding="utf-8")
             except Exception:
@@ -907,144 +1013,150 @@ def generate_cloned_voice(
         engines = ["colab", "local_fish"]
 
     out_audio_tmp = None
+    cleanup_tmp_file: Optional[Path] = None
     used_engine = ""
     errors = []
 
-    for eng in engines:
+    try:
+        for eng in engines:
+            if _CANCEL_REQUESTED:
+                yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
+                return
+
+            try:
+                if eng == "colab":
+                    active_colab_url = get_colab_url(colab_url_input, force_refresh=not bool(_LAST_COLAB_CHECK["url"]))
+                    if not active_colab_url:
+                        active_colab_url = get_colab_url(colab_url_input, force_refresh=True)
+                    if not active_colab_url:
+                        if engine_choice == "코랩 GPU":
+                            yield gr.update(), "", "연결된 코랩이 없습니다. '자동' 또는 '내 PC'를 선택하세요.", get_saved_files_table(str(out_dir))
+                            return
+                        errors.append("코랩 오프라인 -> 내 PC 전환")
+                        continue
+
+                    yield gr.update(), "", "코랩 GPU에서 합성 중...", get_saved_files_table(str(out_dir))
+                    c_colab = get_colab_client(active_colab_url)
+                    upload_arg = None if voice_name == DEFAULT_VOICE_NAME else handle_file(str(trimmed_path))
+                    try:
+                        res = c_colab.predict(
+                            voice_name,
+                            upload_arg,
+                            clean_ref,
+                            target_clean,
+                            float(temp_val),
+                            0.6,
+                            1.2,
+                            api_name="/generate_tts",
+                        )
+                    except Exception:
+                        res = c_colab.predict(
+                            unicodedata.normalize("NFD", voice_name),
+                            handle_file(str(trimmed_path)),
+                            clean_ref,
+                            target_clean,
+                            float(temp_val),
+                            0.6,
+                            1.2,
+                            api_name="/generate_tts",
+                        )
+                    res_audio = res[0] if isinstance(res, (list, tuple)) else res
+                    if isinstance(res_audio, dict) and "path" in res_audio:
+                        res_audio = res_audio["path"]
+                    if res_audio and os.path.exists(str(res_audio)):
+                        out_audio_tmp = str(res_audio)
+                        used_engine = "코랩 GPU"
+                        break
+                    elif isinstance(res, (list, tuple)) and len(res) >= 3 and "base64," in str(res[2]):
+                        m_b64 = re.search(r"base64,([A-Za-z0-9+/=]+)", str(res[2]))
+                        if m_b64:
+                            cleanup_tmp_file = Path(os.environ.get("TEMP", ".")) / f"colab_b64_{os.getpid()}.wav"
+                            cleanup_tmp_file.write_bytes(base64.b64decode(m_b64.group(1)))
+                            out_audio_tmp = str(cleanup_tmp_file)
+                            used_engine = "코랩 GPU"
+                            break
+
+                elif eng == "local_fish":
+                    yield gr.update(), "", "내 PC 엔진에서 합성 중...", get_saved_files_table(str(out_dir))
+                    if str(FISH_ROOT) not in sys.path:
+                        sys.path.insert(0, str(FISH_ROOT))
+                    import torch
+                    from fish_speech.utils.schema import ServeTTSRequest, ServeReferenceAudio
+
+                    engine = get_local_fish_engine()
+                    ref_bytes = get_reference_wav_bytes(trimmed_path)
+                    dynamic_max_tokens = min(512, max(96, int(len(target_clean) * 6.5) + 48))
+
+                    torch.manual_seed(42)
+                    req = ServeTTSRequest(
+                        text=target_clean,
+                        references=[ServeReferenceAudio(audio=ref_bytes, text=clean_ref)],
+                        max_new_tokens=dynamic_max_tokens,
+                        chunk_length=200,
+                        top_p=0.6,
+                        repetition_penalty=1.2,
+                        temperature=float(temp_val),
+                        format="wav",
+                        use_memory_cache="on",
+                        seed=42,
+                    )
+                    for result in engine.inference(req):
+                        if _CANCEL_REQUESTED:
+                            yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
+                            return
+                        if result.code == "final":
+                            sr, wav_data = result.audio
+                            cleanup_tmp_file = Path(os.environ.get("TEMP", ".")) / f"local_fish_out_{os.getpid()}.wav"
+                            sf.write(str(cleanup_tmp_file), wav_data, sr, subtype="PCM_16")
+                            out_audio_tmp = str(cleanup_tmp_file)
+                            used_engine = "내 PC"
+                            break
+                        elif result.code == "error":
+                            errors.append(f"local_fish: {result.error}")
+                            break
+                    if out_audio_tmp:
+                        break
+            except Exception as e:
+                errors.append(f"{eng}: {e}")
+
         if _CANCEL_REQUESTED:
             yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
             return
 
-        try:
-            if eng == "colab":
-                active_colab_url = get_colab_url(colab_url_input, force_refresh=not bool(_LAST_COLAB_CHECK["url"]))
-                if not active_colab_url:
-                    active_colab_url = get_colab_url(colab_url_input, force_refresh=True)
-                if not active_colab_url:
-                    if engine_choice == "코랩 GPU":
-                        yield gr.update(), "", "연결된 코랩이 없습니다. '자동' 또는 '내 PC'를 선택하세요.", get_saved_files_table(str(out_dir))
-                        return
-                    errors.append("코랩 오프라인 -> 내 PC 전환")
-                    continue
+        if not out_audio_tmp or not os.path.exists(out_audio_tmp):
+            yield gr.update(), "", "합성 실패 · " + " / ".join(errors), get_saved_files_table(str(out_dir))
+            return
 
-                yield gr.update(), "", "코랩 GPU에서 합성 중...", get_saved_files_table(str(out_dir))
-                c_colab = get_colab_client(active_colab_url)
-                upload_arg = None if voice_name == DEFAULT_VOICE_NAME else handle_file(str(trimmed_path))
-                try:
-                    res = c_colab.predict(
-                        voice_name,
-                        upload_arg,
-                        clean_ref,
-                        target_clean,
-                        float(temp_val),
-                        0.6,
-                        1.2,
-                        api_name="/generate_tts",
-                    )
-                except Exception:
-                    res = c_colab.predict(
-                        unicodedata.normalize("NFD", voice_name),
-                        handle_file(str(trimmed_path)),
-                        clean_ref,
-                        target_clean,
-                        float(temp_val),
-                        0.6,
-                        1.2,
-                        api_name="/generate_tts",
-                    )
-                res_audio = res[0] if isinstance(res, (list, tuple)) else res
-                if isinstance(res_audio, dict) and "path" in res_audio:
-                    res_audio = res_audio["path"]
-                if res_audio and os.path.exists(str(res_audio)):
-                    out_audio_tmp = str(res_audio)
-                    used_engine = "코랩 GPU"
-                    break
-                elif isinstance(res, (list, tuple)) and len(res) >= 3 and "base64," in str(res[2]):
-                    m_b64 = re.search(r"base64,([A-Za-z0-9+/=]+)", str(res[2]))
-                    if m_b64:
-                        tmp_b64_wav = Path(os.environ.get("TEMP", ".")) / f"colab_b64_{os.getpid()}.wav"
-                        tmp_b64_wav.write_bytes(base64.b64decode(m_b64.group(1)))
-                        out_audio_tmp = str(tmp_b64_wav)
-                        used_engine = "코랩 GPU"
-                        break
+        now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        preview_slug = re.sub(r"[^가-힣a-zA-Z0-9]", "", target_clean)[:12] or "tts"
+        voice_slug = re.sub(r"[^가-힣a-zA-Z0-9_-]", "", audio_path.stem)[:14] or "voice"
+        prefix_clean = re.sub(r'[\\/:*?"<>| ]', "_", (custom_prefix or "").strip())
+        out_filename = f"{prefix_clean}_{now_str}_{preview_slug}.wav" if prefix_clean else f"{now_str}_{voice_slug}_{preview_slug}.wav"
 
-            elif eng == "local_fish":
-                yield gr.update(), "", "내 PC 엔진에서 합성 중...", get_saved_files_table(str(out_dir))
-                if str(FISH_ROOT) not in sys.path:
-                    sys.path.insert(0, str(FISH_ROOT))
-                import torch
-                from fish_speech.utils.schema import ServeTTSRequest, ServeReferenceAudio
+        final_path = out_dir / out_filename
+        save_processed_audio(out_audio_tmp, final_path, float(speed_val), bool(trim_val))
 
-                engine = get_local_fish_engine()
-                ref_bytes = get_reference_wav_bytes(trimmed_path)
-                dynamic_max_tokens = min(512, max(96, int(len(target_clean) * 6.5) + 48))
+        if load_settings().get("also_save_gdrive", True):
+            try:
+                if out_dir.resolve() != G_DRIVE_OUT_DIR.resolve():
+                    G_DRIVE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(final_path, G_DRIVE_OUT_DIR / out_filename)
+            except Exception:
+                pass
 
-                torch.manual_seed(42)
-                req = ServeTTSRequest(
-                    text=target_clean,
-                    references=[ServeReferenceAudio(audio=ref_bytes, text=clean_ref)],
-                    max_new_tokens=dynamic_max_tokens,
-                    chunk_length=200,
-                    top_p=0.6,
-                    repetition_penalty=1.2,
-                    temperature=float(temp_val),
-                    format="wav",
-                    use_memory_cache="on",
-                    seed=42,
-                )
-                for result in engine.inference(req):
-                    if _CANCEL_REQUESTED:
-                        yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
-                        return
-                    if result.code == "final":
-                        sr, wav_data = result.audio
-                        tmp_local = Path(os.environ.get("TEMP", ".")) / f"local_fish_out_{os.getpid()}.wav"
-                        sf.write(str(tmp_local), wav_data, sr)
-                        out_audio_tmp = str(tmp_local)
-                        used_engine = "내 PC"
-                        break
-                    elif result.code == "error":
-                        errors.append(f"local_fish: {result.error}")
-                        break
-                if out_audio_tmp:
-                    break
-        except Exception as e:
-            errors.append(f"{eng}: {e}")
-
-    if _CANCEL_REQUESTED:
-        yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
-        return
-
-    if not out_audio_tmp or not os.path.exists(out_audio_tmp):
-        yield gr.update(), "", "합성 실패 · " + " / ".join(errors), get_saved_files_table(str(out_dir))
-        return
-
-    processed_tmp = postprocess_audio(out_audio_tmp, float(speed_val), bool(trim_val))
-
-    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    preview_slug = re.sub(r"[^가-힣a-zA-Z0-9]", "", target_clean)[:12] or "tts"
-    voice_slug = re.sub(r"[^가-힣a-zA-Z0-9_-]", "", audio_path.stem)[:14] or "voice"
-    prefix_clean = re.sub(r'[\\/:*?"<>| ]', "_", (custom_prefix or "").strip())
-    out_filename = f"{prefix_clean}_{now_str}_{preview_slug}.wav" if prefix_clean else f"{now_str}_{voice_slug}_{preview_slug}.wav"
-
-    final_path = out_dir / out_filename
-    shutil.copy2(processed_tmp, final_path)
-
-    if load_settings().get("also_save_gdrive", True):
-        try:
-            if out_dir.resolve() != G_DRIVE_OUT_DIR.resolve():
-                G_DRIVE_OUT_DIR.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(processed_tmp, G_DRIVE_OUT_DIR / out_filename)
-        except Exception:
-            pass
-
-    elapsed = time.time() - t_start
-    yield (
-        render_audio_html(final_path, "완성", autoplay=True),
-        str(final_path),
-        f"합성 완료 ({elapsed:.1f}초 · {used_engine}) · {out_filename}",
-        get_saved_files_table(str(out_dir)),
-    )
+        elapsed = time.time() - t_start
+        yield (
+            render_audio_html(final_path, "완성", autoplay=True),
+            str(final_path),
+            f"합성 완료 ({elapsed:.1f}초 · {used_engine}) · {out_filename}",
+            get_saved_files_table(str(out_dir)),
+        )
+    finally:
+        if cleanup_tmp_file and cleanup_tmp_file.exists():
+            try:
+                cleanup_tmp_file.unlink()
+            except Exception:
+                pass
 
 
 def open_selected_output_folder(out_dir_str: str, latest_file_str: str = ""):
@@ -1061,72 +1173,9 @@ def open_sample_folder(sample_file_str: str = ""):
     return f"샘플 폴더 열림 · {target_dir}"
 
 
-COLAB_DIRECT_URL = "https://colab.research.google.com/github/jinPP00/tts_studio/blob/main/fish_tts_studio.ipynb"
-
-
-def _send_colab_autorun_keys():
-    """크롬에서 코랩 탭이 열리면 자동으로 Ctrl+F9(모두 실행) 및 경고창 확인(Tab->Enter) 입력"""
-    if sys.platform != "win32":
-        return
-    try:
-        ps_script = (
-            "$ws = New-Object -ComObject WScript.Shell; "
-            "Start-Sleep -Milliseconds 6500; "
-            "$ws.SendKeys('^{F9}'); "
-            "Start-Sleep -Milliseconds 1500; "
-            "$ws.SendKeys('{TAB}{ENTER}');"
-        )
-        _create_process_on_user_desktop(f'powershell.exe -NoProfile -WindowStyle Hidden -Command "{ps_script}"', show_window=0)
-    except Exception:
-        pass
-
-
-def auto_start_colab_from_pc():
-    already_url = get_colab_url(force_refresh=True)
-    if already_url:
-        short_host = already_url.replace("https://", "").replace("http://", "").split("/")[0]
-        yield render_status_badge(f"코랩 GPU 연결됨 · {short_host}", is_online=True), "이미 코랩 GPU가 연결되어 있습니다."
-        return
-
-    unlock_windows_foreground()
-    _create_process_on_user_desktop(f'cmd.exe /c start "" "{COLAB_DIRECT_URL}"', show_window=0)
-    threading.Thread(target=_send_colab_autorun_keys, daemon=True).start()
-    yield render_status_badge("코랩 GPU 시동 중...", is_online=False), "코랩 자동 시동 중 (기다리지 않고 바로 합성 가능)"
-
-    for sec in range(4, 95, 4):
-        time.sleep(4.0)
-        url = get_colab_url(force_refresh=True)
-        if url:
-            short_host = url.replace("https://", "").replace("http://", "").split("/")[0]
-            yield render_status_badge(f"코랩 GPU 연결됨 · {short_host}", is_online=True), f"코랩 GPU 연결 완료 ({short_host})"
-            return
-        yield render_status_badge(f"코랩 시동 대기 ({sec}초)...", is_online=False), f"코랩 준비 중 ({sec}초) · 지금 바로 합성 가능"
-
-    yield get_status_label(force_refresh=True), "내 PC 엔진 대기 중"
-
-
-def shutdown_remote_colab(colab_url_input: str):
-    url = get_colab_url(colab_url_input, force_refresh=True)
-    if not url:
-        return render_status_badge("내 PC 단독 엔진 준비 완료 (코랩 없이 바로 생성)", is_online=False), "현재 연결된 코랩 세션이 없습니다."
-    try:
-        c = get_colab_client(url)
-        c.predict(api_name="/shutdown_colab")
-    except Exception:
-        pass
-    try:
-        urllib.request.urlopen(
-            urllib.request.Request(f"https://ntfy.sh/{NTFY_TOPIC}", data=b"RESET_OLD_COLAB", method="POST"),
-            timeout=3,
-        )
-    except Exception:
-        pass
-    save_settings({"colab_url": ""})
-    _LAST_COLAB_CHECK["url"] = ""
-    _LAST_COLAB_CHECK["ts"] = time.time()
-    return render_status_badge("내 PC 단독 엔진 준비 완료 (코랩 없이 바로 생성)", is_online=False), "코랩 GPU 세션을 안전하게 반납(종료)했습니다."
-
-
+# ==============================================================================
+# 7. 스튜디오 UI 스타일 및 레이아웃
+# ==============================================================================
 FORCE_LIGHT_JS = """
 () => {
     document.documentElement.classList.remove('dark');
@@ -1154,7 +1203,6 @@ STUDIO_CSS = """
     --neutral-800: #27272A !important;
     --neutral-900: #18181B !important;
     --neutral-950: #09090B !important;
-
     --body-background-fill: #F4F4F1 !important;
     --background-fill-primary: #FFFFFF !important;
     --background-fill-secondary: #F8F8F7 !important;
@@ -1162,21 +1210,18 @@ STUDIO_CSS = """
     --border-color-accent: #18181B !important;
     --body-text-color: #18181B !important;
     --body-text-color-subdued: #52525B !important;
-
     --block-background-fill: #FFFFFF !important;
     --block-border-color: #E4E4E7 !important;
     --block-label-text-color: #18181B !important;
     --block-label-background-fill: #F4F4F5 !important;
     --block-title-text-color: #18181B !important;
     --block-info-text-color: #52525B !important;
-
     --input-background-fill: #F8F8F7 !important;
     --input-background-fill-focus: #FFFFFF !important;
     --input-border-color: #D4D4D8 !important;
     --input-border-color-focus: #18181B !important;
     --input-text-color: #18181B !important;
     --input-placeholder-color: #71717A !important;
-
     --checkbox-background-color: #FFFFFF !important;
     --checkbox-background-color-selected: #2563EB !important;
     --checkbox-border-color: #A1A1AA !important;
@@ -1186,14 +1231,12 @@ STUDIO_CSS = """
     --checkbox-label-background-fill-selected: #EEF2FF !important;
     --checkbox-label-text-color: #18181B !important;
     --checkbox-label-text-color-selected: #1E3A8A !important;
-
     --table-even-background-fill: #FAFAFA !important;
     --table-odd-background-fill: #FFFFFF !important;
     --table-row-focus: #F4F4F5 !important;
     --table-border-color: #E4E4E7 !important;
     --table-text-color: #18181B !important;
     --panel-background-fill: #FFFFFF !important;
-
     --button-primary-background-fill: #18181B !important;
     --button-primary-background-fill-hover: #27272A !important;
     --button-primary-text-color: #FFFFFF !important;
@@ -1208,30 +1251,24 @@ body, .gradio-container {
     font-family: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
     letter-spacing: -0.015em !important;
 }
-
 .gradio-container {
     max-width: 1200px !important;
     margin: 0 auto !important;
     padding: 14px 20px 24px 20px !important;
 }
-
 footer { display: none !important; }
 
-/* 모든 블록 라벨, 타이틀, 스팬, 입력 텍스트 가독성 강제 보장 */
 label, .block label, [data-testid="block-info"], .label-wrap, .label-wrap span {
     color: #18181B !important;
     font-weight: 600 !important;
     font-size: 13px !important;
     white-space: nowrap !important;
 }
-
 input, textarea, select, .single-select, .wrap-inner, .secondary-wrap {
     color: #18181B !important;
     background-color: #F8F8F7 !important;
     font-size: 13.5px !important;
 }
-
-/* 드롭다운 내부 입력창이 중간에서 잘리지 않고 끝까지 표시되도록 보정 */
 .wrap-inner, .secondary-wrap {
     width: 100% !important;
     display: flex !important;
@@ -1243,8 +1280,6 @@ input, textarea, select, .single-select, .wrap-inner, .secondary-wrap {
     min-width: 0 !important;
     text-overflow: ellipsis !important;
 }
-
-/* 드롭다운 메뉴 및 선택값 글자색 강제 지정 */
 ul.options, ul.options li, .item {
     background-color: #FFFFFF !important;
     color: #18181B !important;
@@ -1255,7 +1290,6 @@ ul.options li:hover, ul.options li.selected {
     font-weight: 700 !important;
 }
 
-/* 라디오 버튼 & 체크박스: 한 줄(한 단락) 배치 및 선택 시 밝은 블루(#EEF2FF) + 진한 네이비(#1E3A8A) */
 .wrap {
     gap: 6px !important;
     display: flex !important;
@@ -1279,31 +1313,21 @@ label.svelte-1p9xokt, .gradio-radio label, .gradio-checkbox label, fieldset labe
 label.svelte-1p9xokt span, .gradio-radio label span, .gradio-checkbox label span, fieldset label span {
     color: #18181B !important;
 }
-label.svelte-1p9xokt.selected,
-.gradio-radio label.selected,
-.gradio-radio label:has(input:checked),
-fieldset label.selected,
-fieldset label:has(input:checked) {
+label.svelte-1p9xokt.selected, .gradio-radio label.selected, .gradio-radio label:has(input:checked),
+fieldset label.selected, fieldset label:has(input:checked) {
     background: #EEF2FF !important;
     color: #1E3A8A !important;
     border: 1.5px solid #2563EB !important;
     box-shadow: 0 1px 3px rgba(37, 99, 235, 0.12) !important;
 }
-label.svelte-1p9xokt.selected span,
-.gradio-radio label.selected span,
-.gradio-radio label:has(input:checked) span,
-fieldset label.selected span,
-fieldset label:has(input:checked) span {
+label.svelte-1p9xokt.selected span, .gradio-radio label.selected span, .gradio-radio label:has(input:checked) span,
+fieldset label.selected span, fieldset label:has(input:checked) span {
     color: #1E3A8A !important;
     font-weight: 700 !important;
 }
-input[type="radio"], input[type="checkbox"] {
-    accent-color: #2563EB !important;
-}
+input[type="radio"], input[type="checkbox"] { accent-color: #2563EB !important; }
 
-/* 데이터프레임 / 테이블 가독성 보장 */
-table, thead, tbody, tr, th, td,
-.table-wrap, .svelte-1b7421c, [data-testid="dataframe"], [data-testid="dataframe"] * {
+table, thead, tbody, tr, th, td, .table-wrap, .svelte-1b7421c, [data-testid="dataframe"], [data-testid="dataframe"] * {
     background-color: #FFFFFF !important;
     color: #18181B !important;
     border-color: #E4E4E7 !important;
@@ -1315,21 +1339,10 @@ thead th, thead tr th, .header-row th {
     font-weight: 700 !important;
     border-bottom: 1px solid #D4D4D8 !important;
 }
-tbody tr:nth-child(even) td {
-    background-color: #FAFAFA !important;
-    color: #18181B !important;
-}
-tbody tr:hover td {
-    background-color: #EEF2FF !important;
-    color: #1E3A8A !important;
-    cursor: pointer !important;
-}
-.cell-wrap, .cell-wrap span, td span, th span {
-    color: #18181B !important;
-    background: transparent !important;
-}
+tbody tr:nth-child(even) td { background-color: #FAFAFA !important; color: #18181B !important; }
+tbody tr:hover td { background-color: #EEF2FF !important; color: #1E3A8A !important; cursor: pointer !important; }
+.cell-wrap, .cell-wrap span, td span, th span { color: #18181B !important; background: transparent !important; }
 
-/* 상단 헤더 바: 무조건 한 줄(한 단락) 고정 */
 .studio-topbar {
     background: #FFFFFF !important;
     border: 1px solid #E4E4E7 !important;
@@ -1343,9 +1356,7 @@ tbody tr:hover td {
     justify-content: space-between !important;
     gap: 10px !important;
 }
-.studio-topbar > * {
-    min-width: 0 !important;
-}
+.studio-topbar > * { min-width: 0 !important; }
 .studio-topbar button {
     flex: 0 0 auto !important;
     min-width: 84px !important;
@@ -1353,36 +1364,14 @@ tbody tr:hover td {
     padding: 7px 14px !important;
     height: 36px !important;
 }
-
-.brand-header {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    white-space: nowrap;
-}
+.brand-header { display: flex; align-items: center; gap: 9px; white-space: nowrap; }
 .brand-dot {
-    width: 9px;
-    height: 9px;
-    border-radius: 50%;
-    background: #2563EB;
-    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
-    flex-shrink: 0;
+    width: 9px; height: 9px; border-radius: 50%;
+    background: #2563EB; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14); flex-shrink: 0;
 }
-.brand-title {
-    font-size: 16px;
-    font-weight: 700;
-    color: #18181B !important;
-    letter-spacing: -0.02em;
-    margin: 0;
-}
-.brand-sub {
-    font-size: 12px;
-    color: #52525B !important;
-    font-weight: 600;
-    margin-left: 4px;
-}
+.brand-title { font-size: 16px; font-weight: 700; color: #18181B !important; letter-spacing: -0.02em; margin: 0; }
+.brand-sub { font-size: 12px; color: #52525B !important; font-weight: 600; margin-left: 4px; }
 
-/* 좌우 메인 카드 패널 */
 .studio-card {
     background: #FFFFFF !important;
     border: 1px solid #E4E4E7 !important;
@@ -1391,245 +1380,93 @@ tbody tr:hover td {
     box-shadow: 0 4px 16px -2px rgba(15, 23, 42, 0.04) !important;
     gap: 10px !important;
 }
-
 .section-heading {
-    font-size: 12.5px;
-    font-weight: 700;
-    letter-spacing: 0.02em;
-    color: #3F3F46 !important;
-    margin: 0;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    white-space: nowrap;
+    font-size: 12.5px; font-weight: 700; letter-spacing: 0.02em; color: #3F3F46 !important;
+    margin: 0; display: flex; align-items: center; justify-content: space-between; white-space: nowrap;
 }
-.section-heading span {
-    color: #3F3F46 !important;
-}
+.section-heading span { color: #3F3F46 !important; }
+.section-divider { height: 1px; background: #E4E4E7; margin: 4px 0; }
 
-.section-divider {
-    height: 1px;
-    background: #E4E4E7;
-    margin: 4px 0;
-}
-
-/* 한 줄 인라인 컨트롤 행 (드롭다운+폴더버튼, 경로창+변경/열기 버튼) */
 .inline-row {
-    display: flex !important;
-    flex-wrap: nowrap !important;
-    align-items: center !important;
-    gap: 8px !important;
+    display: flex !important; flex-wrap: nowrap !important; align-items: center !important; gap: 8px !important;
 }
-.inline-row > * {
-    min-width: 0 !important;
-}
+.inline-row > * { min-width: 0 !important; }
 .inline-row button {
-    flex: 0 0 auto !important;
-    width: auto !important;
-    min-width: 82px !important;
-    height: 40px !important;
-    padding: 0 13px !important;
+    flex: 0 0 auto !important; width: auto !important; min-width: 82px !important; height: 40px !important; padding: 0 13px !important;
 }
 .single-line-path textarea, .single-line-path input {
-    height: 40px !important;
-    min-height: 40px !important;
-    max-height: 40px !important;
-    padding: 8px 12px !important;
-    white-space: nowrap !important;
-    overflow: hidden !important;
-    text-overflow: ellipsis !important;
-    resize: none !important;
-    line-height: 22px !important;
-    border-radius: 9px !important;
+    height: 40px !important; min-height: 40px !important; max-height: 40px !important;
+    padding: 8px 12px !important; white-space: nowrap !important; overflow: hidden !important;
+    text-overflow: ellipsis !important; resize: none !important; line-height: 22px !important; border-radius: 9px !important;
 }
 
-/* 합성 실행 버튼 행 (꽉 차는 한 줄 배치) */
 .action-row {
-    display: flex !important;
-    flex-wrap: nowrap !important;
-    align-items: center !important;
-    gap: 10px !important;
+    display: flex !important; flex-wrap: nowrap !important; align-items: center !important; gap: 10px !important;
 }
-.action-row > button.primary {
-    flex: 4 1 0% !important;
-}
-.action-row > button.stop {
-    flex: 1 1 0% !important;
-    max-width: 130px !important;
-}
+.action-row > button.primary { flex: 4 1 0% !important; }
+.action-row > button.stop { flex: 1 1 0% !important; max-width: 130px !important; }
 
-/* 커스텀 오디오 플레이어 카드 */
-.audio-player-card {
-    background: #F8F8F7;
-    border: 1px solid #E4E4E7;
-    border-radius: 12px;
-    padding: 10px 14px;
-}
-.audio-card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 6px;
-    gap: 8px;
-}
-.audio-title-wrap {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-    flex: 1;
-}
+.audio-player-card { background: #F8F8F7; border: 1px solid #E4E4E7; border-radius: 12px; padding: 10px 14px; }
+.audio-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 8px; }
+.audio-title-wrap { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
 .audio-badge {
-    background: #2563EB !important;
-    color: #FFFFFF !important;
-    font-size: 11px;
-    font-weight: 600;
-    padding: 2px 8px;
-    border-radius: 6px;
-    white-space: nowrap;
-    flex-shrink: 0;
+    background: #2563EB !important; color: #FFFFFF !important; font-size: 11px; font-weight: 600;
+    padding: 2px 8px; border-radius: 6px; white-space: nowrap; flex-shrink: 0;
 }
 .audio-filename {
-    font-size: 12.5px;
-    font-weight: 600;
-    color: #18181B !important;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    font-size: 12.5px; font-weight: 600; color: #18181B !important;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.audio-meta-wrap {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-shrink: 0;
-}
-.audio-size {
-    font-size: 11.5px;
-    color: #52525B !important;
-    font-weight: 600;
-}
+.audio-meta-wrap { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.audio-size { font-size: 11.5px; color: #52525B !important; font-weight: 600; }
 .audio-dl-btn {
-    background: #FFFFFF !important;
-    border: 1px solid #D4D4D8 !important;
-    color: #18181B !important;
-    text-decoration: none !important;
-    font-size: 11.5px;
-    font-weight: 600;
-    padding: 3px 9px;
-    border-radius: 6px;
+    background: #FFFFFF !important; border: 1px solid #D4D4D8 !important; color: #18181B !important;
+    text-decoration: none !important; font-size: 11.5px; font-weight: 600; padding: 3px 9px; border-radius: 6px;
 }
-.audio-dl-btn:hover {
-    background: #2563EB !important;
-    border-color: #2563EB !important;
-    color: #FFFFFF !important;
-}
-.studio-audio-el {
-    width: 100%;
-    height: 34px;
-    display: block;
-    border-radius: 8px;
-}
+.audio-dl-btn:hover { background: #2563EB !important; border-color: #2563EB !important; color: #FFFFFF !important; }
+.studio-audio-el { width: 100%; height: 34px; display: block; border-radius: 8px; }
 
 .audio-empty-card {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 12px 14px;
-    border: 1px dashed #D4D4D8;
-    border-radius: 12px;
-    background: #FAFAFA;
-    color: #52525B !important;
-    font-size: 12.5px;
-    font-weight: 500;
+    display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+    border: 1px dashed #D4D4D8; border-radius: 12px; background: #FAFAFA;
+    color: #52525B !important; font-size: 12.5px; font-weight: 500;
 }
-.audio-empty-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #A1A1AA;
-    flex-shrink: 0;
-}
+.audio-empty-dot { width: 8px; height: 8px; border-radius: 50%; background: #A1A1AA; flex-shrink: 0; }
 
-/* 대본 입력 에디터 */
 .script-editor textarea {
-    background: #F8F8F7 !important;
-    border: 1px solid #D4D4D8 !important;
-    border-radius: 12px !important;
-    padding: 12px 14px !important;
-    font-size: 15px !important;
-    line-height: 1.55 !important;
-    color: #18181B !important;
+    background: #F8F8F7 !important; border: 1px solid #D4D4D8 !important; border-radius: 12px !important;
+    padding: 12px 14px !important; font-size: 15px !important; line-height: 1.55 !important; color: #18181B !important;
 }
 .script-editor textarea:focus {
-    background: #FFFFFF !important;
-    border-color: #2563EB !important;
-    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1) !important;
+    background: #FFFFFF !important; border-color: #2563EB !important; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1) !important;
 }
 
-/* 주요 실행 버튼 */
 button.primary {
-    background: #1D4ED8 !important;
-    color: #FFFFFF !important;
-    border: none !important;
-    border-radius: 11px !important;
-    font-size: 14.5px !important;
-    font-weight: 700 !important;
-    min-height: 44px !important;
-    white-space: nowrap !important;
-    box-shadow: 0 3px 10px rgba(29, 78, 216, 0.18) !important;
+    background: #1D4ED8 !important; color: #FFFFFF !important; border: none !important;
+    border-radius: 11px !important; font-size: 14.5px !important; font-weight: 700 !important;
+    min-height: 44px !important; white-space: nowrap !important; box-shadow: 0 3px 10px rgba(29, 78, 216, 0.18) !important;
 }
-button.primary, button.primary *, button.primary span {
-    color: #FFFFFF !important;
-}
-button.primary:hover {
-    background: #1E40AF !important;
-}
+button.primary, button.primary *, button.primary span { color: #FFFFFF !important; }
+button.primary:hover { background: #1E40AF !important; }
 
 button.secondary, button.stop {
-    background: #F4F4F5 !important;
-    color: #18181B !important;
-    border: 1px solid #D4D4D8 !important;
-    border-radius: 9px !important;
-    font-weight: 600 !important;
-    font-size: 12.5px !important;
-    white-space: nowrap !important;
+    background: #F4F4F5 !important; color: #18181B !important; border: 1px solid #D4D4D8 !important;
+    border-radius: 9px !important; font-weight: 600 !important; font-size: 12.5px !important; white-space: nowrap !important;
 }
-button.secondary *, button.stop * {
-    color: #18181B !important;
-}
-button.secondary:hover, button.stop:hover {
-    background: #E4E4E7 !important;
-    color: #09090B !important;
-}
-.main-stop-btn {
-    min-height: 44px !important;
-    border-radius: 11px !important;
-}
+button.secondary *, button.stop * { color: #18181B !important; }
+button.secondary:hover, button.stop:hover { background: #E4E4E7 !important; color: #09090B !important; }
+.main-stop-btn { min-height: 44px !important; border-radius: 11px !important; }
 
-/* 상태 알림 바 */
 .status-toast textarea, .status-toast input {
-    background: #F4F4F5 !important;
-    border: 1px solid #E4E4E7 !important;
-    border-radius: 9px !important;
-    padding: 8px 12px !important;
-    height: 36px !important;
-    min-height: 36px !important;
-    max-height: 36px !important;
-    font-size: 12.5px !important;
-    font-weight: 600 !important;
-    color: #18181B !important;
+    background: #F4F4F5 !important; border: 1px solid #E4E4E7 !important; border-radius: 9px !important;
+    padding: 8px 12px !important; height: 36px !important; min-height: 36px !important; max-height: 36px !important;
+    font-size: 12.5px !important; font-weight: 600 !important; color: #18181B !important;
 }
 
-/* 아코디언 정돈 */
 .gradio-accordion {
-    border: 1px solid #E4E4E7 !important;
-    border-radius: 10px !important;
-    background: #FAFAFA !important;
-    overflow: hidden !important;
+    border: 1px solid #E4E4E7 !important; border-radius: 10px !important; background: #FAFAFA !important; overflow: hidden !important;
 }
-.gradio-accordion > .label-wrap {
-    padding: 8px 12px !important;
-}
+.gradio-accordion > .label-wrap { padding: 8px 12px !important; }
 """
 
 initial_cfg = load_settings()
@@ -1640,6 +1477,12 @@ initial_preview_html, initial_ref_text, initial_sample_path = on_voice_select(in
 initial_table = get_saved_files_table(str(initial_out_dir))
 initial_latest_out_path = initial_table[0][3] if initial_table else ""
 initial_output_html = render_audio_html(initial_latest_out_path, "완성본", autoplay=False)
+initial_saved_colab = initial_cfg.get("colab_url", "").strip()
+initial_badge_html = (
+    render_status_badge(f"코랩 GPU 연결됨 · {initial_saved_colab.replace('https://', '').split('/')[0]}", is_online=True)
+    if initial_saved_colab
+    else render_status_badge("내 PC 단독 모드 (코랩 없이 즉시 생성)", is_online=False)
+)
 
 with gr.Blocks(title="Voice Studio") as demo:
     sample_path_state = gr.State(initial_sample_path)
@@ -1658,7 +1501,7 @@ with gr.Blocks(title="Voice Studio") as demo:
             </div>
             """
         )
-        colab_status_txt = gr.HTML(value=get_status_label())
+        colab_status_txt = gr.HTML(value=initial_badge_html)
         colab_btn = gr.Button("코랩 시동", variant="secondary", size="sm")
         colab_kill_btn = gr.Button("코랩 종료", variant="secondary", size="sm")
         refresh_btn = gr.Button("새로고침", variant="secondary", size="sm")
@@ -1688,7 +1531,15 @@ with gr.Blocks(title="Voice Studio") as demo:
                 )
                 new_upload = gr.Audio(sources=["upload"], type="filepath", label="오디오 업로드")
                 with gr.Row(elem_classes="inline-row"):
-                    new_name = gr.Textbox(placeholder="저장할 목소리 이름", lines=1, max_lines=1, show_label=False, container=False, scale=3, elem_classes="single-line-path")
+                    new_name = gr.Textbox(
+                        placeholder="저장할 목소리 이름",
+                        lines=1,
+                        max_lines=1,
+                        show_label=False,
+                        container=False,
+                        scale=3,
+                        elem_classes="single-line-path",
+                    )
                     save_sample_btn = gr.Button("목소리 등록", variant="secondary", size="sm", scale=1)
 
             gr.HTML('<div class="section-divider"></div>')
@@ -1781,7 +1632,6 @@ with gr.Blocks(title="Voice Studio") as demo:
         outputs=[sample_audio_html, ref_text_box, sample_path_state],
         queue=False,
     )
-
     folder_preset_radio.change(
         fn=set_preset_folder,
         inputs=[folder_preset_radio],

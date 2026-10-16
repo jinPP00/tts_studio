@@ -335,21 +335,24 @@ gr.close_all()
 exts = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
 _CANCEL_COLAB = False
 _CURRENT_SHARE_URL = ""
+_COLAB_HTML_CACHE = {}
 
 
 def render_audio_html(file_path, label="오디오 재생", autoplay=False):
-    """코랩 iframe 프록시 병목을 막기 위해 단일 Base64 + 24kHz 경량 미리듣기 적용"""
+    """원본 44.1kHz 무손실 Base64 오디오 플레이어 (인메모리 캐싱 적용)"""
     if not file_path or not os.path.exists(str(file_path)):
         return f"<div style='padding:10px; border:1px solid #d1d5db; border-radius:6px; color:#6b7280; font-size:13px;'>[{label}] 대본을 입력하고 '음성 생성' 버튼을 누르면 여기에 재생 바가 나타납니다.</div>"
     try:
         p = Path(file_path)
-        wav_24k, _ = librosa.load(str(p), sr=24000, mono=True)
-        buf = io.BytesIO()
-        sf.write(buf, wav_24k, 24000, format="WAV", subtype="PCM_16")
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        st = p.stat()
+        cache_key = (str(p.resolve()), st.st_mtime_ns, st.st_size, label, autoplay)
+        if not autoplay and cache_key in _COLAB_HTML_CACHE:
+            return _COLAB_HTML_CACHE[cache_key]
+
+        b64 = base64.b64encode(p.read_bytes()).decode("ascii")
         auto_attr = "autoplay" if autoplay else ""
         uid = f"aud_{int(time.time()*1000)}"
-        return f"""
+        html = f"""
         <div style="padding:10px 12px; border:1px solid #d1d5db; border-radius:6px; background:#ffffff;">
             <div style="display:flex; justify-content:space-between; margin-bottom:6px; font-size:13px; color:#374151;">
                 <span style="font-weight:600;">{label} — {p.name}</span>
@@ -358,6 +361,9 @@ def render_audio_html(file_path, label="오디오 재생", autoplay=False):
             <audio id="{uid}" controls {auto_attr} preload="auto" style="width:100%; height:40px; display:block;" src="data:audio/wav;base64,{b64}"></audio>
         </div>
         """
+        if not autoplay:
+            _COLAB_HTML_CACHE[cache_key] = html
+        return html
     except Exception as e:
         return f"<div>오류: {e}</div>"
 
@@ -486,7 +492,6 @@ def generate_tts(voice_name, uploaded_file, ref_text, target_text, temp, top_p, 
 
 
 init_sample_name = get_sample_list()[0]
-init_sample_html = render_audio_html(SAMPLE_DIR / init_sample_name, "샘플 미리듣기", autoplay=False)
 
 with gr.Blocks(title="AI 음성 복제 (코랩)") as demo:
     mode_str = "T4 GPU 고속 모드" if device == "cuda" else "CPU 고속 모드"
@@ -502,7 +507,7 @@ with gr.Blocks(title="AI 음성 복제 (코랩)") as demo:
                 allow_custom_value=True,
                 label="샘플 목소리",
             )
-            sample_player_html = gr.HTML(value=init_sample_html)
+            sample_player_html = gr.HTML(value=render_audio_html(None, "샘플 미리듣기"))
             refresh_btn = gr.Button("목록 새로고침", size="sm")
             with gr.Accordion("샘플 추가 / 원본 대사", open=False):
                 ref_text_box = gr.Textbox(value=load_saved_ref_text(init_sample_name), lines=2, label="샘플 대사")
@@ -522,8 +527,8 @@ with gr.Blocks(title="AI 음성 복제 (코랩)") as demo:
             audio_out = gr.Audio(label="API 연동용 오디오", visible=False)
 
             with gr.Accordion("세부 설정", open=False):
-                temp_slider = gr.Slider(0.1, 1.0, value=0.7, step=0.05, label="Temperature")
-                top_p_slider = gr.Slider(0.1, 1.0, value=0.7, step=0.05, label="Top-P")
+                temp_slider = gr.Slider(0.1, 1.0, value=0.6, step=0.05, label="Temperature")
+                top_p_slider = gr.Slider(0.1, 1.0, value=0.6, step=0.05, label="Top-P")
                 rep_slider = gr.Slider(0.9, 2.0, value=1.2, step=0.05, label="Repetition Penalty")
 
     voice_dropdown.change(fn=on_colab_voice_change, inputs=[voice_dropdown], outputs=[sample_player_html, ref_text_box], queue=False)
@@ -536,6 +541,7 @@ with gr.Blocks(title="AI 음성 복제 (코랩)") as demo:
     )
     stop_btn.click(fn=cancel_colab_gen, inputs=[], outputs=[status_box], cancels=[gen_ev], queue=False)
     shutdown_btn.click(fn=shutdown_colab_runtime, inputs=[], outputs=[status_box], api_name="shutdown_colab", queue=False)
+    demo.load(fn=lambda: render_audio_html(SAMPLE_DIR / init_sample_name, "샘플 미리듣기", False), inputs=[], outputs=[sample_player_html], queue=False)
 
 _, _, share_url = demo.launch(
     share=True,
@@ -548,7 +554,12 @@ if share_url:
     _CURRENT_SHARE_URL = share_url.strip()
     try:
         urllib.request.urlopen(
-            urllib.request.Request("https://ntfy.sh/jinpp00_fish_tts_colab_2026", data=_CURRENT_SHARE_URL.encode("utf-8"), method="POST"),
+            urllib.request.Request(
+                "https://ntfy.sh/jinpp00_fish_tts_colab_2026",
+                data=_CURRENT_SHARE_URL.encode("utf-8"),
+                headers={"User-Agent": "Mozilla/5.0"},
+                method="POST",
+            ),
             timeout=5,
         )
     except Exception:
