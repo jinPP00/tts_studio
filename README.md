@@ -1,31 +1,30 @@
 # AI 음성 복제 스튜디오 (TTS Studio — Fish Speech 1.5)
 
-무료 오픈소스 **Fish Speech 1.5** 기반의 한국어 AI 음성 복제(Zero-Shot Voice Cloning) 로컬 & 구글 코랩 하이브리드 스튜디오입니다.
+무료 오픈소스 **Fish Speech 1.5** 기반의 한국어 AI 음성 복제(Zero-Shot Voice Cloning) 로컬 & 구글 코랩 하이브리드 스튜디오입니다.  
+이 저장소(`https://github.com/jinPP00/tts_studio.git`)를 어느 컴퓨터에서나 `git clone` / `git pull` 받으면 별도 설정 없이 100% 동일하게 동작합니다.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jinPP00/tts_studio/blob/main/fish_tts_studio.ipynb)
+---
 
-## 주요 기능
+## 🔗 바로 접속 주소 (어느 컴퓨터/브라우저에서나 동일)
 
-- **코랩 T4 GPU 1순위 + 내 PC 로컬 엔진 자동 백업**
-  - 코랩이 켜져 있으면 초고속 T4 GPU 서버로 생성하고, 코랩이 꺼져 있으면 1.5초 만에 감지하여 재시도 대기 없이 내 PC 로컬 `Fish Speech 1.5` 엔진으로 즉시 전환합니다.
-- **드라이브 권한 팝업 없음 & T4 GPU 자동 고정**
-  - 코랩 노트북(`fish_tts_studio.ipynb`)에 T4 GPU 메타데이터가 내장되어 있으며, 번거로운 구글 드라이브 마운트 권한 팝업 없이 코랩 내부 SSD에서 즉시 구동됩니다.
-- **실시간 취소(정지) 및 코랩 세션 반납**
-  - 생성 도중 언제든 `정지 (취소)` 버튼으로 즉시 중단할 수 있으며, 작업 완료 후 `코랩 세션 반납` 버튼으로 코랩 GPU 세션을 깔끔하게 종료하여 *"활성 세션이 너무 많습니다"* 오류를 방지합니다.
-- **원하는 로컬 폴더에 즉시 저장 & 브라우저 기본 오디오 플레이어**
-  - 바탕화면(`TTS_완성본`), 다운로드 폴더, 구글 드라이브 또는 원하는 임의 폴더에 즉시 `.wav` 파일로 저장됩니다.
-  - 브라우저 표준 HTML5 `<audio controls>` 플레이어와 `윈도우 기본 플레이어로 재생` 버튼을 탑재해 끊김 없는 재생을 보장합니다.
+* **구글 코랩 원클릭 서버 & 웹 스튜디오 바로가기:**  
+  👉 **[https://colab.research.google.com/github/jinPP00/tts_studio/blob/main/fish_tts_studio.ipynb](https://colab.research.google.com/github/jinPP00/tts_studio/blob/main/fish_tts_studio.ipynb)**
+* **GitHub 저장소 주소:**  
+  👉 **[https://github.com/jinPP00/tts_studio](https://github.com/jinPP00/tts_studio)**
 
-## 파일 구성
+---
 
-- `app.py` — 내 PC 로컬 웹 스튜디오 (`http://127.0.0.1:7865`)
-- `launch.py` / `무료_AI_음성복제_스튜디오.bat` — 원클릭 자동 실행 런처
-- `fish_tts_studio.ipynb` — 구글 코랩 T4 GPU 원클릭 서버 노트북
-- `update_nb.py` — 코랩 노트북 생성 및 업데이트 스크립트
-- `샘플목소리/` — 기본 참조 목소리 샘플 및 대사 텍스트
+## 💻 다른 컴퓨터(새 PC)에서 똑같이 사용하는 방법
 
-## 실행 방법
+### 방법 A. `git clone` / `git pull` 후 실행 (권장)
+```bash
+git clone https://github.com/jinPP00/tts_studio.git C:\projects\tts_studio
+cd C:\projects\tts_studio
+무료_AI_음성복제_스튜디오.bat
+```
+- 이미 클론된 PC에서는 폴더 안의 **`무료_AI_음성복제_스튜디오.bat`**만 더블클릭하면 자동으로 `git pull`을 수행하여 최신 버전 및 접속 주소를 동기화하고 `http://127.0.0.1:7865` 스튜디오를 실행합니다.
+- 폴더 안의 **`코랩_웹스튜디오_바로가기.url`** (또는 **`코랩_서버_열기.bat`**)을 더블클릭하면 위 코랩 접속 주소가 브라우저에서 즉시 열립니다.
+- 새 PC에서 코랩이 꺼져 있을 때 `내 PC 로컬` 모드로 생성하면, `fish-speech` 엔진과 1.2GB 모델 가중치(`model.pth`)까지 자동으로 다운로드·설치되어 동일하게 작동합니다.
 
-1. `무료_AI_음성복제_스튜디오.bat` 실행 (또는 `python app.py`)
-2. 코랩 가속 사용 시 상단 **[코랩 열기]** 클릭 후 노트북의 **▶ 코랩 엔진 켜기** 버튼 1회 클릭
-3. 대본 입력 후 **[음성 생성]** 클릭
+### 방법 B. 설치 없이 웹브라우저에서만 사용
+- 파이썬·Git이 없는 외부 PC에서는 위 **구글 코랩 바로가기 주소**만 열면 코랩 화면 내부에서 샘플 미리듣기·음성 복제·WAV 다운로드를 모두 동일하게 사용할 수 있습니다.

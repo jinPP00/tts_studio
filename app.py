@@ -186,6 +186,62 @@ def get_status_label() -> str:
     return "코랩 오프라인 (내 PC 로컬 대기)"
 
 
+def ensure_local_fish_installed():
+    import subprocess
+    if not (FISH_ROOT / ".project-root").exists():
+        shutil.rmtree(FISH_ROOT, ignore_errors=True)
+        subprocess.run(
+            ["git", "clone", "-b", "v1.5.1", "--depth", "1", "https://github.com/fishaudio/fish-speech.git", str(FISH_ROOT)],
+            check=True,
+        )
+        subprocess.run(
+            [
+                sys.executable, "-m", "pip", "install", "-q", "--no-deps",
+                "einx==0.2.2", "vector_quantize_pytorch==1.14.24", "loralib",
+                "pyrootutils", "resampy", "opencc-python-reimplemented",
+            ],
+            check=False,
+        )
+        subprocess.run(
+            [
+                sys.executable, "-m", "pip", "install", "-q",
+                "hydra-core>=1.3.2", "omegaconf", "loguru", "ormsgpack",
+                "tiktoken", "silero-vad", "einops", "python-dotenv",
+            ],
+            check=False,
+        )
+        (FISH_ROOT / "fish_speech" / "utils" / "__init__.py").write_text(
+            "import random\nimport numpy as np\nimport torch\nfrom loguru import logger as _logger\n"
+            "from .braceexpand import braceexpand\nfrom .context import autocast_exclude_mps\n"
+            "from .file import get_latest_checkpoint\n\ndef RankedLogger(*args, **kwargs):\n    return _logger\n\n"
+            "def set_seed(seed: int):\n    random.seed(seed)\n    np.random.seed(seed)\n    torch.manual_seed(seed)\n",
+            encoding="utf-8",
+        )
+        _fp = FISH_ROOT / "fish_speech" / "utils" / "file.py"
+        if _fp.exists():
+            _fp.write_text(_fp.read_text(encoding="utf-8").replace("from natsort import natsorted", "natsorted = sorted"), encoding="utf-8")
+        for _rel in ["fish_speech/models/text2semantic/inference.py", "fish_speech/models/text2semantic/llama.py"]:
+            _p = FISH_ROOT / _rel
+            if _p.exists():
+                _p.write_text(_p.read_text(encoding="utf-8").replace("from transformers import AutoTokenizer", "AutoTokenizer = None"), encoding="utf-8")
+
+    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    hf_base = "https://huggingface.co/fishaudio/fish-speech-1.5/resolve/main"
+    ms_base = "https://www.modelscope.cn/models/fishaudio/fish-speech-1.5/resolve/master"
+    for fname in ["config.json", "special_tokens.json", "tokenizer.tiktoken", "firefly-gan-vq-fsq-8x1024-21hz-generator.pth", "model.pth"]:
+        fpath = CKPT_DIR / fname
+        if not fpath.exists() or fpath.stat().st_size < 500:
+            for base in [hf_base, ms_base]:
+                try:
+                    req = urllib.request.Request(f"{base}/{fname}", headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=60) as r, open(fpath, "wb") as out_f:
+                        shutil.copyfileobj(r, out_f)
+                    if fpath.exists() and fpath.stat().st_size >= 500:
+                        break
+                except Exception:
+                    pass
+
+
 def get_local_fish_engine():
     global _LOCAL_FISH_ENGINE
     if _LOCAL_FISH_ENGINE is not None:
@@ -193,7 +249,7 @@ def get_local_fish_engine():
 
     model_file = CKPT_DIR / "model.pth"
     if not model_file.exists() or model_file.stat().st_size < 1200000000:
-        raise RuntimeError("로컬 모델이 준비되지 않았습니다.")
+        ensure_local_fish_installed()
 
     if str(FISH_ROOT) not in sys.path:
         sys.path.insert(0, str(FISH_ROOT))
