@@ -14,7 +14,8 @@ from datetime import datetime
 
 os.environ["EINX_FILTER_TRACEBACK"] = "false"
 
-FISH_ROOT = Path(r"C:\projects\tts_studio\fish-speech")
+STUDIO_DIR = Path(__file__).resolve().parent
+FISH_ROOT = STUDIO_DIR / "fish-speech"
 CKPT_DIR = FISH_ROOT / "checkpoints" / "fish-speech-1.5"
 if str(FISH_ROOT) not in sys.path:
     sys.path.insert(0, str(FISH_ROOT))
@@ -25,12 +26,14 @@ import librosa
 import gradio as gr
 from gradio_client import Client, handle_file
 
-STUDIO_DIR = Path(r"C:\projects\tts_studio")
 SETTINGS_FILE = STUDIO_DIR / "settings.json"
 
 DESKTOP_OUT_DIR = Path.home() / "Desktop" / "TTS_완성본"
 DOWNLOADS_OUT_DIR = Path.home() / "Downloads" / "TTS_완성본"
-G_DRIVE_BASE = Path(r"G:\내 드라이브\TTS")
+G_DRIVE_BASE = next(
+    (p for p in [Path(r"G:\내 드라이브\TTS"), Path(r"G:\My Drive\TTS"), Path(r"H:\내 드라이브\TTS")] if p.parent.exists()),
+    STUDIO_DIR / "TTS_Drive_Backup",
+)
 G_DRIVE_SAMPLE_DIR = G_DRIVE_BASE / "샘플목소리"
 G_DRIVE_OUT_DIR = G_DRIVE_BASE / "완성본"
 LOCAL_SAMPLE_DIR = STUDIO_DIR / "샘플목소리"
@@ -49,6 +52,19 @@ try:
                 shutil.copy2(_f, _dst)
 except Exception:
     pass
+
+# 다른 PC에서 처음 실행해 샘플 폴더가 비어 있을 경우 내장된 기본 샘플 자동 복원
+_default_wav = LOCAL_SAMPLE_DIR / "recording-2026.-10.-16.-오후-1-19-43.wav"
+_b64_file = STUDIO_DIR / "sample_voice.b64"
+if not _default_wav.exists() and _b64_file.exists():
+    try:
+        _default_wav.write_bytes(base64.b64decode(_b64_file.read_bytes()))
+        (LOCAL_SAMPLE_DIR / "recording-2026.-10.-16.-오후-1-19-43.txt").write_text(
+            "아컨텐츠 제작을 위해서 더빙을 해야는데 어떻게 진행을 해야 되는지 고민이시군요 고객님 그러실 때는 타입캐스트를 사용해 보시는 걸 추천드리는데요 다양한 에이아의 캐릭터들과 자연스러운,",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 NTFY_TOPIC = "jinpp00_fish_tts_colab_2026"
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
