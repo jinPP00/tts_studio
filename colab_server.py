@@ -22,7 +22,11 @@ SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_VOICE_NAME = "recording-2026.-10.-16.-오후-1-19-43.wav"
-DEFAULT_REF_TEXT = "아 컨텐츠 제작을 위해서 더빙을 해야 되는데 어떻게 진행을 해야 되는지 고민이시군요 고객님."
+DEFAULT_REF_TEXT = (
+    "아 컨텐츠 제작을 위해서 더빙을 해야 되는데 어떻게 진행을 해야 되는지 고민이시군요 고객님. "
+    "그러실 때는 타입캐스트를 사용해 보시는 걸 추천드리는데요."
+)
+OLD_SHORT_REF_TEXT = "아 컨텐츠 제작을 위해서 더빙을 해야 되는데 어떻게 진행을 해야 되는지 고민이시군요 고객님."
 
 
 def download_url_to_file(url: str, dst: Path, min_size: int = 100) -> bool:
@@ -53,8 +57,8 @@ def download_url_to_file(url: str, dst: Path, min_size: int = 100) -> bool:
 def ensure_default_sample():
     target_wav = SAMPLE_DIR / DEFAULT_VOICE_NAME
     target_txt = SAMPLE_DIR / "recording-2026.-10.-16.-오후-1-19-43.txt"
-    # 기존 15초 미완성 문장 샘플(>700KB)이 있으면 6.8초 완결 문장 샘플(~600KB)로 자동 교체
-    if not target_wav.exists() or target_wav.stat().st_size < 1000 or target_wav.stat().st_size > 700000:
+    # 12.4초 완결 2문장 샘플(~1.09MB) 유지
+    if not target_wav.exists() or target_wav.stat().st_size < 900000 or target_wav.stat().st_size > 1200000:
         for b64_url in [
             "https://raw.githubusercontent.com/jinPP00/tts_studio/main/sample_voice.b64",
             "https://gist.githubusercontent.com/jinPP00/7990cb24cd047b3f2622296b7d2ed4fa/raw/sample_voice.b64",
@@ -182,6 +186,7 @@ if "tts_engine" not in globals():
         if _mod_name.startswith("fish_speech"):
             del sys.modules[_mod_name]
 
+import hashlib
 import numpy as np
 import torch
 import librosa
@@ -203,37 +208,34 @@ def _safe_load_audio(self, reference_audio, sr):
     return wav
 
 
+def _safe_load_by_hash(self, references, use_memory_cache: str = "off"):
+    prompt_tokens, prompt_texts = [], []
+    for ref in references:
+        key = hashlib.sha256(ref.audio + (ref.text or "").encode("utf-8")).hexdigest()
+        if use_memory_cache == "on" and key in self.ref_by_hash:
+            tok, txt = self.ref_by_hash[key]
+        else:
+            tok = self.vq_manager.encode_reference(ref.audio, enable_reference_audio=True)
+            txt = ref.text
+            self.ref_by_hash[key] = (tok, txt)
+        prompt_tokens.append(tok)
+        prompt_texts.append(txt)
+    return prompt_tokens, prompt_texts
+
+
 ref_mod.ReferenceLoader.__init__ = _safe_init
 ref_mod.ReferenceLoader.load_audio = _safe_load_audio
+ref_mod.ReferenceLoader.load_by_hash = _safe_load_by_hash
 
 
 def apply_fish_speed_patch():
-    """CUDA GPU-CPU 동기화 병목(cudaStreamSynchronize) 완전 제거 및 Top-K 고속 샘플링 패치"""
+    """CPU 모드일 때만 KV-Cache 슬라이싱 적용 (음성 품질 및 샘플링 확률 분포는 원본 100% 보존)"""
     try:
         from torch import Tensor
-        from typing import Optional, Tuple
+        from typing import Optional
         import torch.nn.functional as F
         import fish_speech.models.text2semantic.llama as llama_mod
-        import fish_speech.models.text2semantic.inference as inf_mod
 
-        def _fast_embed(self, inp: Tensor, share_codebook_embeddings=True) -> Tensor:
-            if not hasattr(self, "_sem_min"):
-                self._sem_min = min(self.semantic_token_ids)
-                self._sem_max = max(self.semantic_token_ids)
-            embeds = []
-            for i in range(self.config.num_codebooks):
-                if share_codebook_embeddings:
-                    emb = self.codebook_embeddings(inp[:, i + 1] + i * self.config.codebook_size)
-                else:
-                    emb = self.codebook_embeddings(inp[:, i + 1])
-                embeds.append(emb)
-            vq_embeds_sum = torch.stack(embeds, dim=1).sum(dim=1)
-            vq_embeds_sum[(inp[:, 0] < self._sem_min) | (inp[:, 0] > self._sem_max)] = 0
-            return self.embeddings(inp[:, 0]) + vq_embeds_sum
-
-        llama_mod.BaseTransformer.embed = _fast_embed
-
-        # CPU일 때만 KV-Cache 슬라이싱 적용 (CUDA에서는 int(input_pos[-1]) 호출 시 PCIe 동기화 병목이 발생하므로 원형 유지)
         if not torch.cuda.is_available():
             def _fast_kv_update_cpu(self, input_pos: Tensor, k_val: Tensor, v_val: Tensor):
                 self.k_cache[:, :, input_pos] = k_val
@@ -272,38 +274,6 @@ def apply_fish_speed_patch():
                 return self.fast_output(self.fast_norm(x))
 
             llama_mod.DualARTransformer.forward_generate_fast = _fast_forward_generate_fast_cpu
-
-        def _fast_sample(
-            logits,
-            previous_tokens: Optional[torch.Tensor] = None,
-            **sampling_kwargs,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            logit_1d = logits[0, -1]
-            if logit_1d.size(-1) > 512:
-                if previous_tokens is not None:
-                    previous_tokens = previous_tokens.long()
-                    rep_pen = sampling_kwargs.get("repetition_penalty", 1.0)
-                    score = torch.gather(logit_1d, dim=0, index=previous_tokens)
-                    score = torch.where(score < 0, score * rep_pen, score / rep_pen)
-                    logit_1d.scatter_(dim=0, index=previous_tokens, src=score)
-                top_vals, top_idx = torch.topk(logit_1d, 256, dim=-1)
-                sorted_probs = torch.nn.functional.softmax(top_vals, dim=-1)
-                cum_probs = torch.cumsum(sorted_probs, dim=-1)
-                top_p_val = sampling_kwargs.get("top_p", 0.7)
-                remove_mask = cum_probs > top_p_val
-                remove_mask[0] = False
-                top_vals = top_vals.masked_fill(remove_mask, -float("Inf"))
-                temp_val = sampling_kwargs.get("temperature", 0.7)
-                probs_top = torch.nn.functional.softmax(top_vals / temp_val, dim=-1)
-                q = torch.empty_like(probs_top).exponential_(1)
-                local_idx = torch.argmax(probs_top / q, dim=-1, keepdim=True)
-                idx_next = top_idx.gather(0, local_idx).to(dtype=torch.int)
-                return idx_next, probs_top
-            probs = inf_mod.logits_to_probs(logits=logit_1d, previous_tokens=previous_tokens, **sampling_kwargs)
-            idx_next = inf_mod.multinomial_sample_one_no_sync(probs)
-            return idx_next, probs
-
-        inf_mod.sample = _fast_sample
     except Exception:
         pass
 
@@ -342,9 +312,9 @@ _COLAB_REF_CACHE = {}
 
 
 def get_colab_ref_bytes(audio_path: Path) -> bytes:
-    key = f"{audio_path.resolve()}_{audio_path.stat().st_mtime_ns}"
+    key = f"{audio_path.resolve()}_{audio_path.stat().st_mtime_ns}_13s"
     if key not in _COLAB_REF_CACHE:
-        wav_ref, sr_ref = librosa.load(str(audio_path), sr=44100, mono=True, duration=6.8)
+        wav_ref, sr_ref = librosa.load(str(audio_path), sr=44100, mono=True, duration=13.0)
         buf = io.BytesIO()
         sf.write(buf, wav_ref, sr_ref, format="WAV", subtype="PCM_16")
         _COLAB_REF_CACHE[key] = buf.getvalue()
@@ -404,7 +374,7 @@ def load_saved_ref_text(voice_name):
     txt_path = SAMPLE_DIR / (Path(voice_name).stem + ".txt")
     if txt_path.exists():
         txt = txt_path.read_text(encoding="utf-8").strip()
-        if txt and not txt.endswith(","):
+        if txt and txt != OLD_SHORT_REF_TEXT and not txt.endswith(","):
             return txt
     return DEFAULT_REF_TEXT
 
@@ -474,13 +444,16 @@ def generate_tts(voice_name, uploaded_file, ref_text, target_text, temp, top_p, 
         v_label = Path(voice_name).stem
 
     clean_ref = (ref_text or "").strip()
-    if not clean_ref or clean_ref.endswith(","):
+    if not clean_ref or clean_ref == OLD_SHORT_REF_TEXT or clean_ref.endswith(","):
         clean_ref = DEFAULT_REF_TEXT
 
     audio_bytes = get_colab_ref_bytes(audio_path)
     target_clean = target_text.strip()
     dynamic_max_tokens = min(512, max(96, int(len(target_clean) * 6.5) + 48))
 
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
     req = ServeTTSRequest(
         text=target_clean,
         references=[ServeReferenceAudio(audio=audio_bytes, text=clean_ref)],
@@ -491,6 +464,7 @@ def generate_tts(voice_name, uploaded_file, ref_text, target_text, temp, top_p, 
         temperature=float(temp),
         format="wav",
         use_memory_cache="on",
+        seed=42,
     )
 
     for result in tts_engine.inference(req):

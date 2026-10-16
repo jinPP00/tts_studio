@@ -57,11 +57,15 @@ except Exception:
     pass
 
 DEFAULT_VOICE_NAME = "recording-2026.-10.-16.-오후-1-19-43.wav"
-DEFAULT_REF_TEXT = "아 컨텐츠 제작을 위해서 더빙을 해야 되는데 어떻게 진행을 해야 되는지 고민이시군요 고객님."
+DEFAULT_REF_TEXT = (
+    "아 컨텐츠 제작을 위해서 더빙을 해야 되는데 어떻게 진행을 해야 되는지 고민이시군요 고객님. "
+    "그러실 때는 타입캐스트를 사용해 보시는 걸 추천드리는데요."
+)
+OLD_SHORT_REF_TEXT = "아 컨텐츠 제작을 위해서 더빙을 해야 되는데 어떻게 진행을 해야 되는지 고민이시군요 고객님."
 
 _default_wav = LOCAL_SAMPLE_DIR / DEFAULT_VOICE_NAME
 _b64_file = STUDIO_DIR / "sample_voice.b64"
-if (not _default_wav.exists() or _default_wav.stat().st_size > 700000) and _b64_file.exists():
+if (not _default_wav.exists() or _default_wav.stat().st_size < 900000 or _default_wav.stat().st_size > 1200000) and _b64_file.exists():
     try:
         _default_wav.write_bytes(base64.b64decode(_b64_file.read_bytes()))
         (LOCAL_SAMPLE_DIR / "recording-2026.-10.-16.-오후-1-19-43.txt").write_text(
@@ -371,14 +375,13 @@ def get_status_label(force_refresh: bool = False) -> str:
 
 
 def apply_fish_speed_patch():
-    """Fish Speech 1.5 KV-Cache 슬라이싱 및 Top-K 샘플링 고속화 패치"""
+    """Fish Speech 1.5 KV-Cache 슬라이싱 패치 (음성 품질/샘플링 확률 분포는 원본 100% 유지)"""
     try:
         import torch
         from torch import Tensor
-        from typing import Optional, Tuple
+        from typing import Optional
         import torch.nn.functional as F
         import fish_speech.models.text2semantic.llama as llama_mod
-        import fish_speech.models.text2semantic.inference as inf_mod
         from contextlib import nullcontext
         import fish_speech.utils.context as ctx_mod
 
@@ -398,23 +401,6 @@ def apply_fish_speed_patch():
             return self.k_cache[:, :, :end_pos], self.v_cache[:, :, :end_pos]
 
         llama_mod.KVCache.update = _fast_kv_update
-
-        def _fast_embed(self, inp: Tensor, share_codebook_embeddings=True) -> Tensor:
-            if not hasattr(self, "_sem_min"):
-                self._sem_min = min(self.semantic_token_ids)
-                self._sem_max = max(self.semantic_token_ids)
-            embeds = []
-            for i in range(self.config.num_codebooks):
-                if share_codebook_embeddings:
-                    emb = self.codebook_embeddings(inp[:, i + 1] + i * self.config.codebook_size)
-                else:
-                    emb = self.codebook_embeddings(inp[:, i + 1])
-                embeds.append(emb)
-            vq_embeds_sum = torch.stack(embeds, dim=1).sum(dim=1)
-            vq_embeds_sum[(inp[:, 0] < self._sem_min) | (inp[:, 0] > self._sem_max)] = 0
-            return self.embeddings(inp[:, 0]) + vq_embeds_sum
-
-        llama_mod.BaseTransformer.embed = _fast_embed
 
         def _fast_forward_generate(
             self,
@@ -456,38 +442,6 @@ def apply_fish_speed_patch():
             return self.fast_output(fast_out)
 
         llama_mod.DualARTransformer.forward_generate_fast = _fast_forward_generate_fast
-
-        def _fast_sample(
-            logits,
-            previous_tokens: Optional[torch.Tensor] = None,
-            **sampling_kwargs,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            logit_1d = logits[0, -1]
-            if logit_1d.size(-1) > 512:
-                if previous_tokens is not None:
-                    previous_tokens = previous_tokens.long()
-                    rep_pen = sampling_kwargs.get("repetition_penalty", 1.0)
-                    score = torch.gather(logit_1d, dim=0, index=previous_tokens)
-                    score = torch.where(score < 0, score * rep_pen, score / rep_pen)
-                    logit_1d.scatter_(dim=0, index=previous_tokens, src=score)
-                top_vals, top_idx = torch.topk(logit_1d, 256, dim=-1)
-                sorted_probs = torch.nn.functional.softmax(top_vals, dim=-1)
-                cum_probs = torch.cumsum(sorted_probs, dim=-1)
-                top_p_val = sampling_kwargs.get("top_p", 0.7)
-                remove_mask = cum_probs > top_p_val
-                remove_mask[0] = False
-                top_vals = top_vals.masked_fill(remove_mask, -float("Inf"))
-                temp_val = sampling_kwargs.get("temperature", 0.7)
-                probs_top = torch.nn.functional.softmax(top_vals / temp_val, dim=-1)
-                q = torch.empty_like(probs_top).exponential_(1)
-                local_idx = torch.argmax(probs_top / q, dim=-1, keepdim=True)
-                idx_next = top_idx.gather(0, local_idx).to(dtype=torch.int)
-                return idx_next, probs_top
-            probs = inf_mod.logits_to_probs(logits=logit_1d, previous_tokens=previous_tokens, **sampling_kwargs)
-            idx_next = inf_mod.multinomial_sample_one_no_sync(probs)
-            return idx_next, probs
-
-        inf_mod.sample = _fast_sample
     except Exception:
         pass
 
@@ -563,6 +517,7 @@ def get_local_fish_engine():
         if str(FISH_ROOT) not in sys.path:
             sys.path.insert(0, str(FISH_ROOT))
 
+        import hashlib
         import torch
         try:
             torch.set_num_threads(max(4, (os.cpu_count() or 8) // 2))
@@ -584,8 +539,23 @@ def get_local_fish_engine():
                 wav, _ = librosa.load(str(reference_audio), sr=sr, mono=True)
             return wav
 
+        def _safe_load_by_hash(self, references, use_memory_cache: str = "off"):
+            prompt_tokens, prompt_texts = [], []
+            for ref in references:
+                key = hashlib.sha256(ref.audio + (ref.text or "").encode("utf-8")).hexdigest()
+                if use_memory_cache == "on" and key in self.ref_by_hash:
+                    tok, txt = self.ref_by_hash[key]
+                else:
+                    tok = self.vq_manager.encode_reference(ref.audio, enable_reference_audio=True)
+                    txt = ref.text
+                    self.ref_by_hash[key] = (tok, txt)
+                prompt_tokens.append(tok)
+                prompt_texts.append(txt)
+            return prompt_tokens, prompt_texts
+
         ref_mod.ReferenceLoader.__init__ = _safe_init
         ref_mod.ReferenceLoader.load_audio = _safe_load_audio
+        ref_mod.ReferenceLoader.load_by_hash = _safe_load_by_hash
         apply_fish_speed_patch()
 
         orig_cwd = os.getcwd()
@@ -622,9 +592,9 @@ def get_local_fish_engine():
 
 
 def get_reference_wav_bytes(audio_path: Path) -> bytes:
-    key = f"{audio_path.resolve()}_{audio_path.stat().st_mtime_ns}"
+    key = f"{audio_path.resolve()}_{audio_path.stat().st_mtime_ns}_13s"
     if key not in _REF_BYTES_CACHE:
-        wav_ref, sr_ref = librosa.load(str(audio_path), sr=44100, mono=True, duration=6.8)
+        wav_ref, sr_ref = librosa.load(str(audio_path), sr=44100, mono=True, duration=13.0)
         buf = io.BytesIO()
         sf.write(buf, wav_ref, sr_ref, format="WAV", subtype="PCM_16")
         _REF_BYTES_CACHE[key] = buf.getvalue()
@@ -656,9 +626,9 @@ def prepare_10s_wav(audio_path: Path) -> Path:
                 sampwidth = w.getsampwidth()
                 sr = w.getframerate()
                 n_frames = w.getnframes()
-                if (n_frames / float(sr)) <= 7.5:
+                if (n_frames / float(sr)) <= 13.0:
                     return audio_path
-                raw = w.readframes(int(6.8 * sr))
+                raw = w.readframes(int(12.5 * sr))
             trimmed_path = Path(os.environ.get("TEMP", ".")) / f"trimmed_{audio_path.stem}.wav"
             with wave.open(str(trimmed_path), "wb") as w_out:
                 w_out.setnchannels(n_channels)
@@ -680,13 +650,21 @@ def find_sample_path(voice_name: str) -> Path:
 
 
 def auto_recognize_text(audio_path: Path) -> str:
+    if audio_path.name == DEFAULT_VOICE_NAME:
+        for d in [G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR]:
+            txt_path = d / f"{audio_path.stem}.txt"
+            if txt_path.exists():
+                content = txt_path.read_text(encoding="utf-8").strip()
+                if content and content != OLD_SHORT_REF_TEXT and not content.endswith(","):
+                    return content
+        return DEFAULT_REF_TEXT
     for d in [G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR]:
         txt_path = d / f"{audio_path.stem}.txt"
         if txt_path.exists():
             content = txt_path.read_text(encoding="utf-8").strip()
             if content and not content.endswith(","):
                 return content
-    return DEFAULT_REF_TEXT if audio_path.name == DEFAULT_VOICE_NAME else ""
+    return ""
 
 
 def get_sample_files():
@@ -894,7 +872,9 @@ def generate_cloned_voice(
         return
 
     clean_ref = (ref_text or "").strip()
-    if not clean_ref or clean_ref.endswith(","):
+    if audio_path.name == DEFAULT_VOICE_NAME and (not clean_ref or clean_ref == OLD_SHORT_REF_TEXT or clean_ref.endswith(",")):
+        clean_ref = DEFAULT_REF_TEXT
+    elif not clean_ref or clean_ref.endswith(","):
         clean_ref = auto_recognize_text(audio_path)
     else:
         for d in [G_DRIVE_SAMPLE_DIR, LOCAL_SAMPLE_DIR]:
@@ -934,7 +914,7 @@ def generate_cloned_voice(
 
                 yield gr.update(), "", "코랩 GPU에서 합성 중...", get_saved_files_table(str(out_dir))
                 c_colab = get_colab_client(active_colab_url)
-                upload_arg = None if voice_name == DEFAULT_VOICE_NAME else handle_file(str(trimmed_path))
+                upload_arg = handle_file(str(trimmed_path))
                 try:
                     res = c_colab.predict(
                         voice_name,
@@ -942,7 +922,7 @@ def generate_cloned_voice(
                         clean_ref,
                         target_clean,
                         float(temp_val),
-                        0.7,
+                        0.6,
                         1.2,
                         api_name="/generate_tts",
                     )
@@ -953,7 +933,7 @@ def generate_cloned_voice(
                         clean_ref,
                         target_clean,
                         float(temp_val),
-                        0.7,
+                        0.6,
                         1.2,
                         api_name="/generate_tts",
                     )
@@ -977,22 +957,25 @@ def generate_cloned_voice(
                 yield gr.update(), "", "내 PC 엔진에서 합성 중...", get_saved_files_table(str(out_dir))
                 if str(FISH_ROOT) not in sys.path:
                     sys.path.insert(0, str(FISH_ROOT))
+                import torch
                 from fish_speech.utils.schema import ServeTTSRequest, ServeReferenceAudio
 
                 engine = get_local_fish_engine()
                 ref_bytes = get_reference_wav_bytes(trimmed_path)
                 dynamic_max_tokens = min(512, max(96, int(len(target_clean) * 6.5) + 48))
 
+                torch.manual_seed(42)
                 req = ServeTTSRequest(
                     text=target_clean,
                     references=[ServeReferenceAudio(audio=ref_bytes, text=clean_ref)],
                     max_new_tokens=dynamic_max_tokens,
                     chunk_length=200,
-                    top_p=0.7,
+                    top_p=0.6,
                     repetition_penalty=1.2,
                     temperature=float(temp_val),
                     format="wav",
                     use_memory_cache="on",
+                    seed=42,
                 )
                 for result in engine.inference(req):
                     if _CANCEL_REQUESTED:
@@ -1655,7 +1638,7 @@ with gr.Blocks(title="Voice Studio") as demo:
             with gr.Accordion("상세 설정 (파일명 · 억양 · 무음)", open=False):
                 with gr.Row():
                     custom_prefix_box = gr.Textbox(value="", placeholder="예: 오프닝", label="파일명 접두어")
-                    temp_slider = gr.Slider(0.3, 1.0, value=0.7, step=0.05, label="억양 변화 (0.7)")
+                    temp_slider = gr.Slider(0.3, 1.0, value=0.6, step=0.05, label="억양 변화 (0.6 권장)")
                 with gr.Row():
                     trim_chk = gr.Checkbox(value=True, label="앞뒤 무음 제거")
                     colab_url_box = gr.Textbox(value="", placeholder="자동 연결", label="코랩 주소")
