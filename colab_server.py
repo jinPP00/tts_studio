@@ -338,6 +338,9 @@ _CURRENT_SHARE_URL = ""
 _COLAB_HTML_CACHE = {}
 
 
+import html
+
+
 def render_audio_html(file_path, label="오디오 재생", autoplay=False):
     """원본 44.1kHz 무손실 Base64 오디오 플레이어 (인메모리 캐싱 적용)"""
     if not file_path or not os.path.exists(str(file_path)):
@@ -351,19 +354,20 @@ def render_audio_html(file_path, label="오디오 재생", autoplay=False):
 
         b64 = base64.b64encode(p.read_bytes()).decode("ascii")
         auto_attr = "autoplay" if autoplay else ""
-        uid = f"aud_{int(time.time()*1000)}"
-        html = f"""
-        <div style="padding:10px 12px; border:1px solid #d1d5db; border-radius:6px; background:#ffffff;">
+        safe_name = html.escape(p.name, quote=True)
+        safe_label = html.escape(label, quote=True)
+        card_html = f"""
+        <div class="colab-aud-card" style="padding:10px 12px; border:1px solid #d1d5db; border-radius:6px; background:#ffffff;">
             <div style="display:flex; justify-content:space-between; margin-bottom:6px; font-size:13px; color:#374151;">
-                <span style="font-weight:600;">{label} — {p.name}</span>
-                <a href="#" onclick="const a=document.createElement('a');a.href=document.getElementById('{uid}').src;a.download='{p.name}';a.click();return false;" style="color:#111827; text-decoration:underline; font-size:12px;">다운로드</a>
+                <span style="font-weight:600;">{safe_label} — {safe_name}</span>
+                <a href="#" data-fn="{safe_name}" onclick="const c=this.closest('.colab-aud-card');const a=document.createElement('a');a.href=c.querySelector('audio').src;a.download=this.dataset.fn;a.click();return false;" style="color:#111827; text-decoration:underline; font-size:12px;">다운로드</a>
             </div>
-            <audio id="{uid}" controls {auto_attr} preload="auto" style="width:100%; height:40px; display:block;" src="data:audio/wav;base64,{b64}"></audio>
+            <audio controls {auto_attr} preload="auto" style="width:100%; height:40px; display:block;" src="data:audio/wav;base64,{b64}"></audio>
         </div>
         """
         if not autoplay:
-            _COLAB_HTML_CACHE[cache_key] = html
-        return html
+            _COLAB_HTML_CACHE[cache_key] = card_html
+        return card_html
     except Exception as e:
         return f"<div>오류: {e}</div>"
 

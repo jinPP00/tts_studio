@@ -2,6 +2,7 @@ import os
 import sys
 import io
 import re
+import html
 import json
 import time
 import wave
@@ -325,16 +326,21 @@ def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> st
         with urllib.request.urlopen(req, timeout=4.5) as resp:
             lines = [json.loads(line) for line in resp.read().decode("utf-8").splitlines() if line.strip()]
             msgs = [m.get("message", "").strip() for m in lines if m.get("event") == "message"]
+            checked = set()
             for msg in reversed(msgs):
                 if msg == "RESET_OLD_COLAB":
                     break
                 if msg.startswith("https://") and "gradio.live" in msg and "33eb403275e9404ad6" not in msg and "test-colab" not in msg:
+                    if msg in checked:
+                        continue
+                    checked.add(msg)
                     if is_colab_alive(msg):
                         save_settings({"colab_url": msg})
                         _LAST_COLAB_CHECK["ts"] = now
                         _LAST_COLAB_CHECK["url"] = msg
                         return msg
-                    break
+                    if len(checked) >= 2:
+                        break
     except Exception:
         pass
 
@@ -427,11 +433,17 @@ def shutdown_remote_colab(colab_url_input: str):
         pass
     try:
         urllib.request.urlopen(
-            urllib.request.Request(f"https://ntfy.sh/{NTFY_TOPIC}", data=b"RESET_OLD_COLAB", method="POST"),
+            urllib.request.Request(
+                f"https://ntfy.sh/{NTFY_TOPIC}",
+                data=b"RESET_OLD_COLAB",
+                headers={"User-Agent": "Mozilla/5.0"},
+                method="POST",
+            ),
             timeout=3,
         )
     except Exception:
         pass
+    _COLAB_CLIENT_CACHE.clear()
     save_settings({"colab_url": ""})
     _LAST_COLAB_CHECK["url"] = ""
     _LAST_COLAB_CHECK["ts"] = time.time()
@@ -709,27 +721,28 @@ def render_audio_html(file_path, label: str = "오디오 미리듣기", autoplay
         ext = p.suffix.lower().lstrip(".")
         mime = "audio/mpeg" if ext == "mp3" else ("audio/mp4" if ext == "m4a" else "audio/wav")
         auto_attr = "autoplay" if autoplay else ""
-        uid = f"audio_{int(time.time() * 1000)}_{os.getpid()}"
-        html = f"""
+        safe_name = html.escape(p.name, quote=True)
+        safe_label = html.escape(label, quote=True)
+        card_html = f"""
         <div class="audio-player-card">
             <div class="audio-card-header">
                 <div class="audio-title-wrap">
-                    <span class="audio-badge">{label}</span>
-                    <span class="audio-filename" title="{p.name}">{p.name}</span>
+                    <span class="audio-badge">{safe_label}</span>
+                    <span class="audio-filename" title="{safe_name}">{safe_name}</span>
                 </div>
                 <div class="audio-meta-wrap">
                     <span class="audio-size">{size_kb} KB</span>
-                    <a href="#" class="audio-dl-btn" onclick="const a=document.createElement('a');a.href=document.getElementById('{uid}').src;a.download='{p.name}';a.click();return false;">저장</a>
+                    <a href="#" data-fn="{safe_name}" class="audio-dl-btn" onclick="const c=this.closest('.audio-player-card');const a=document.createElement('a');a.href=c.querySelector('audio').src;a.download=this.dataset.fn;a.click();return false;">저장</a>
                 </div>
             </div>
-            <audio id="{uid}" controls {auto_attr} preload="auto" class="studio-audio-el" src="data:{mime};base64,{b64}"></audio>
+            <audio controls {auto_attr} preload="auto" class="studio-audio-el" src="data:{mime};base64,{b64}"></audio>
         </div>
         """
         if not autoplay:
             if len(_AUDIO_HTML_CACHE) > 24:
                 _AUDIO_HTML_CACHE.clear()
-            _AUDIO_HTML_CACHE[cache_key] = html
-        return html
+            _AUDIO_HTML_CACHE[cache_key] = card_html
+        return card_html
     except Exception as e:
         return f"<div class='audio-empty-card' style='color:#dc2626;'>오디오 로드 실패: {e}</div>"
 
@@ -810,44 +823,51 @@ def on_voice_select(voice_name: str):
     )
 
 
+def _list_recent_audio_files(out_dir_str: str = "") -> list[Path]:
+    path_str = (out_dir_str or "").strip() or load_settings().get("output_dir", str(DESKTOP_OUT_DIR))
+    out_dir = Path(path_str)
+    if not out_dir.exists() or not out_dir.is_dir():
+        return []
+    return sorted(
+        (f for f in out_dir.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTS),
+        key=lambda x: x.stat().st_mtime,
+        reverse=True,
+    )
+
+
 def get_saved_files_table(out_dir_str: str = "") -> list[list[str]]:
-    out_dir = get_active_output_dir(out_dir_str)
     rows = []
-    if out_dir.exists():
-        wavs = sorted(
-            (f for f in out_dir.iterdir() if f.is_file() and f.suffix.lower() in AUDIO_EXTS),
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        )
-        for f in wavs[:6]:
-            st = f.stat()
-            dt = datetime.fromtimestamp(st.st_mtime).strftime("%m-%d %H:%M")
-            rows.append([f.name, f"{st.st_size // 1024} KB", dt, str(f)])
+    for f in _list_recent_audio_files(out_dir_str)[:6]:
+        st = f.stat()
+        dt = datetime.fromtimestamp(st.st_mtime).strftime("%m-%d %H:%M")
+        rows.append([f.name, f"{st.st_size // 1024} KB", dt])
     return rows
 
 
 def on_history_select(evt: gr.SelectData, table_data, current_out_dir: str = ""):
     try:
         row_idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else int(evt.index)
-        file_path = ""
+        file_name = ""
         if hasattr(table_data, "iloc"):
             row = table_data.iloc[row_idx]
-            file_path = str(row.iloc[3] if hasattr(row, "iloc") else row[3])
+            file_name = str(row.iloc[0] if hasattr(row, "iloc") else row[0])
         elif isinstance(table_data, dict) and "data" in table_data:
-            file_path = str(table_data["data"][row_idx][3])
+            file_name = str(table_data["data"][row_idx][0])
         elif isinstance(table_data, (list, tuple)) and len(table_data) > row_idx:
-            file_path = str(table_data[row_idx][3])
+            file_name = str(table_data[row_idx][0])
 
-        if (not file_path or not os.path.exists(file_path)) and current_out_dir:
-            rows = get_saved_files_table(current_out_dir)
-            if len(rows) > row_idx:
-                file_path = rows[row_idx][3]
+        out_dir = get_active_output_dir(current_out_dir)
+        candidate = out_dir / file_name if file_name else None
+        if (not candidate or not candidate.exists()):
+            recent = _list_recent_audio_files(current_out_dir)
+            if len(recent) > row_idx:
+                candidate = recent[row_idx]
 
-        if file_path and os.path.exists(file_path):
+        if candidate and candidate.exists():
             return (
-                render_audio_html(file_path, "재생 중", autoplay=True),
-                str(file_path),
-                f"선택 트랙 재생 · {Path(file_path).name}",
+                render_audio_html(candidate, "재생 중", autoplay=True),
+                str(candidate),
+                f"선택 트랙 재생 · {candidate.name}",
             )
     except Exception as e:
         return gr.update(), gr.update(), f"목록 선택 오류: {e}"
@@ -870,7 +890,24 @@ def save_processed_audio(src_path: str, dst_path: Path, speed: float, trim_silen
         shutil.copy2(src_path, dst_path)
 
 
+def get_preset_name_for_dir(path_str: str) -> Optional[str]:
+    try:
+        norm = os.path.normcase(os.path.normpath(str(Path(path_str).resolve())))
+        for label, target in (
+            ("바탕화면", DESKTOP_OUT_DIR),
+            ("다운로드", DOWNLOADS_OUT_DIR),
+            ("G드라이브", G_DRIVE_OUT_DIR),
+        ):
+            if norm == os.path.normcase(os.path.normpath(str(target.resolve()))):
+                return label
+    except Exception:
+        pass
+    return None
+
+
 def set_preset_folder(preset_name: str):
+    if not preset_name:
+        return gr.update(), gr.update(), gr.update()
     mapping = {
         "바탕화면": str(DESKTOP_OUT_DIR),
         "다운로드": str(DOWNLOADS_OUT_DIR),
@@ -880,6 +917,13 @@ def set_preset_folder(preset_name: str):
     Path(chosen).mkdir(parents=True, exist_ok=True)
     save_settings({"output_dir": chosen})
     return chosen, get_saved_files_table(chosen), f"저장 위치 변경 · {chosen}"
+
+
+def apply_custom_folder(custom_dir: str):
+    out_dir = get_active_output_dir(custom_dir)
+    chosen = str(out_dir)
+    save_settings({"output_dir": chosen})
+    return chosen, get_preset_name_for_dir(chosen), get_saved_files_table(chosen), f"저장 위치 변경 · {chosen}"
 
 
 def browse_custom_folder(current_dir: str):
@@ -907,11 +951,11 @@ def browse_custom_folder(current_dir: str):
                     norm_path = str(Path(selected))
                     Path(norm_path).mkdir(parents=True, exist_ok=True)
                     save_settings({"output_dir": norm_path})
-                    return norm_path, get_saved_files_table(norm_path), f"저장 위치 변경 · {norm_path}"
+                    return norm_path, get_preset_name_for_dir(norm_path), get_saved_files_table(norm_path), f"저장 위치 변경 · {norm_path}"
                 break
     except Exception as e:
-        return current_dir, get_saved_files_table(current_dir), f"폴더 변경 실패: {e}"
-    return current_dir, get_saved_files_table(current_dir), "폴더 변경 취소됨"
+        return current_dir, get_preset_name_for_dir(current_dir), get_saved_files_table(current_dir), f"폴더 변경 실패: {e}"
+    return current_dir, get_preset_name_for_dir(current_dir), get_saved_files_table(current_dir), "폴더 변경 취소됨"
 
 
 def refresh_all(current_out_dir: str):
@@ -1253,8 +1297,11 @@ body, .gradio-container {
 }
 .gradio-container {
     max-width: 1200px !important;
+    width: 100% !important;
     margin: 0 auto !important;
     padding: 14px 20px 24px 20px !important;
+    box-sizing: border-box !important;
+    overflow-x: hidden !important;
 }
 footer { display: none !important; }
 
@@ -1264,7 +1311,8 @@ label, .block label, [data-testid="block-info"], .label-wrap, .label-wrap span {
     font-size: 13px !important;
     white-space: nowrap !important;
 }
-input, textarea, select, .single-select, .wrap-inner, .secondary-wrap {
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+textarea, select, .single-select, .wrap-inner, .secondary-wrap {
     color: #18181B !important;
     background-color: #F8F8F7 !important;
     font-size: 13.5px !important;
@@ -1314,24 +1362,43 @@ label.svelte-1p9xokt span, .gradio-radio label span, .gradio-checkbox label span
     color: #18181B !important;
 }
 label.svelte-1p9xokt.selected, .gradio-radio label.selected, .gradio-radio label:has(input:checked),
-fieldset label.selected, fieldset label:has(input:checked) {
+.gradio-checkbox label:has(input:checked), fieldset label.selected, fieldset label:has(input:checked) {
     background: #EEF2FF !important;
     color: #1E3A8A !important;
     border: 1.5px solid #2563EB !important;
     box-shadow: 0 1px 3px rgba(37, 99, 235, 0.12) !important;
 }
 label.svelte-1p9xokt.selected span, .gradio-radio label.selected span, .gradio-radio label:has(input:checked) span,
-fieldset label.selected span, fieldset label:has(input:checked) span {
+.gradio-checkbox label:has(input:checked) span, fieldset label.selected span, fieldset label:has(input:checked) span {
     color: #1E3A8A !important;
     font-weight: 700 !important;
 }
-input[type="radio"], input[type="checkbox"] { accent-color: #2563EB !important; }
+input[type="radio"], input[type="checkbox"] {
+    accent-color: #2563EB !important;
+    background-color: #FFFFFF !important;
+    border: 1.5px solid #71717A !important;
+    cursor: pointer !important;
+}
+input[type="radio"]:checked, input[type="checkbox"]:checked {
+    background-color: #2563EB !important;
+    border-color: #2563EB !important;
+    accent-color: #2563EB !important;
+}
 
 table, thead, tbody, tr, th, td, .table-wrap, .svelte-1b7421c, [data-testid="dataframe"], [data-testid="dataframe"] * {
     background-color: #FFFFFF !important;
     color: #18181B !important;
     border-color: #E4E4E7 !important;
     font-size: 12.5px !important;
+}
+.table-wrap, [data-testid="dataframe"] {
+    width: 100% !important;
+    max-width: 100% !important;
+    overflow-x: hidden !important;
+}
+[data-testid="dataframe"] table {
+    width: 100% !important;
+    table-layout: fixed !important;
 }
 thead th, thead tr th, .header-row th {
     background-color: #F4F4F5 !important;
@@ -1341,7 +1408,16 @@ thead th, thead tr th, .header-row th {
 }
 tbody tr:nth-child(even) td { background-color: #FAFAFA !important; color: #18181B !important; }
 tbody tr:hover td { background-color: #EEF2FF !important; color: #1E3A8A !important; cursor: pointer !important; }
-.cell-wrap, .cell-wrap span, td span, th span { color: #18181B !important; background: transparent !important; }
+.cell-wrap, .cell-wrap span, td span, th span {
+    color: #18181B !important;
+    background: transparent !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+}
+[data-testid="dataframe"] th:nth-child(1), [data-testid="dataframe"] td:nth-child(1) { width: 62% !important; }
+[data-testid="dataframe"] th:nth-child(2), [data-testid="dataframe"] td:nth-child(2) { width: 16% !important; }
+[data-testid="dataframe"] th:nth-child(3), [data-testid="dataframe"] td:nth-child(3) { width: 22% !important; }
 
 .studio-topbar {
     background: #FFFFFF !important;
@@ -1355,6 +1431,7 @@ tbody tr:hover td { background-color: #EEF2FF !important; color: #1E3A8A !import
     align-items: center !important;
     justify-content: space-between !important;
     gap: 10px !important;
+    box-sizing: border-box !important;
 }
 .studio-topbar > * { min-width: 0 !important; }
 .studio-topbar button {
@@ -1379,7 +1456,12 @@ tbody tr:hover td { background-color: #EEF2FF !important; color: #1E3A8A !import
     padding: 18px 20px !important;
     box-shadow: 0 4px 16px -2px rgba(15, 23, 42, 0.04) !important;
     gap: 10px !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    overflow-x: hidden !important;
+    box-sizing: border-box !important;
 }
+.studio-card > * { min-width: 0 !important; max-width: 100% !important; }
 .section-heading {
     font-size: 12.5px; font-weight: 700; letter-spacing: 0.02em; color: #3F3F46 !important;
     margin: 0; display: flex; align-items: center; justify-content: space-between; white-space: nowrap;
@@ -1463,19 +1545,26 @@ button.secondary:hover, button.stop:hover { background: #E4E4E7 !important; colo
     font-size: 12.5px !important; font-weight: 600 !important; color: #18181B !important;
 }
 
-.gradio-accordion {
-    border: 1px solid #E4E4E7 !important; border-radius: 10px !important; background: #FAFAFA !important; overflow: hidden !important;
+.gradio-accordion, .accordion {
+    border: 1px solid #E4E4E7 !important;
+    border-radius: 10px !important;
+    background: #FAFAFA !important;
+    overflow: hidden !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
 }
-.gradio-accordion > .label-wrap { padding: 8px 12px !important; }
+.gradio-accordion > .label-wrap, .accordion > .label-wrap { padding: 8px 12px !important; }
 """
 
 initial_cfg = load_settings()
 initial_out_dir = get_active_output_dir(initial_cfg.get("output_dir", str(DESKTOP_OUT_DIR)))
+initial_preset_val = get_preset_name_for_dir(str(initial_out_dir))
 initial_choices = get_sample_files()
 initial_voice = initial_choices[0] if initial_choices else None
 initial_preview_html, initial_ref_text, initial_sample_path = on_voice_select(initial_voice)
+initial_recent_files = _list_recent_audio_files(str(initial_out_dir))
 initial_table = get_saved_files_table(str(initial_out_dir))
-initial_latest_out_path = initial_table[0][3] if initial_table else ""
+initial_latest_out_path = str(initial_recent_files[0]) if initial_recent_files else ""
 initial_output_html = render_audio_html(initial_latest_out_path, "완성본", autoplay=False)
 initial_saved_colab = initial_cfg.get("colab_url", "").strip()
 initial_badge_html = (
@@ -1546,7 +1635,7 @@ with gr.Blocks(title="Voice Studio") as demo:
             gr.HTML('<div class="section-heading"><span>02 · 저장 폴더</span></div>')
             folder_preset_radio = gr.Radio(
                 choices=["바탕화면", "다운로드", "G드라이브"],
-                value="바탕화면" if str(initial_out_dir) == str(DESKTOP_OUT_DIR) else None,
+                value=initial_preset_val,
                 show_label=False,
                 container=False,
             )
@@ -1619,11 +1708,13 @@ with gr.Blocks(title="Voice Studio") as demo:
 
             with gr.Accordion("최근 생성 목록 (클릭 시 바로 재생)", open=False):
                 history_table = gr.Dataframe(
-                    headers=["파일명", "용량", "시각", "경로"],
-                    datatype=["str", "str", "str", "str"],
+                    headers=["파일명", "용량", "시각"],
+                    datatype=["str", "str", "str"],
+                    column_widths=["58%", "18%", "24%"],
                     value=initial_table,
                     show_label=False,
                     interactive=False,
+                    wrap=False,
                 )
 
     voice_dropdown.change(
@@ -1641,13 +1732,13 @@ with gr.Blocks(title="Voice Studio") as demo:
     browse_folder_btn.click(
         fn=browse_custom_folder,
         inputs=[output_dir_box],
-        outputs=[output_dir_box, history_table, status_box],
+        outputs=[output_dir_box, folder_preset_radio, history_table, status_box],
         queue=False,
     )
-    output_dir_box.change(
-        fn=lambda d: get_saved_files_table(d),
+    output_dir_box.submit(
+        fn=apply_custom_folder,
         inputs=[output_dir_box],
-        outputs=[history_table],
+        outputs=[output_dir_box, folder_preset_radio, history_table, status_box],
         queue=False,
     )
     refresh_btn.click(
