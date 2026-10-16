@@ -377,19 +377,64 @@ def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> st
     return ""
 
 
+COLAB_FREE_DAILY_BUDGET_MIN = 150  # 무료 코랩 일일 평균 가용 한도(약 2시간 30분 = 150분)
+
+
+def _get_today_past_colab_sec() -> int:
+    cfg = load_settings()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if cfg.get("colab_daily_date") != today_str:
+        save_settings({"colab_daily_date": today_str, "colab_daily_past_sec": 0})
+        return 0
+    return int(cfg.get("colab_daily_past_sec") or 0)
+
+
+def _record_finished_colab_session(started_at: float):
+    if started_at <= 0:
+        return
+    dur = max(0, min(14400, int(time.time() - started_at)))
+    if dur <= 0:
+        return
+    past = _get_today_past_colab_sec()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    save_settings({"colab_daily_date": today_str, "colab_daily_past_sec": past + dur})
+
+
 def format_colab_uptime(started_at: float = 0.0) -> str:
     ts = started_at or float(_LAST_COLAB_CHECK.get("started_at") or load_settings().get("colab_started_at") or 0.0)
-    if ts <= 0:
-        return "방금 시동됨"
-    elapsed_sec = max(0, int(time.time() - ts))
-    mins = elapsed_sec // 60
-    if mins < 1:
-        return "방금 시동됨 (1분 미만)"
-    if mins < 60:
-        return f"{mins}분째 가동 중 (무료 약 2~3시간)"
-    hours = mins // 60
-    rem_mins = mins % 60
-    return f"{hours}시간 {rem_mins:02d}분째 가동 중 (무료 약 2~3시간)"
+    session_sec = max(0, int(time.time() - ts)) if ts > 0 else 0
+    total_today_sec = _get_today_past_colab_sec() + session_sec
+    session_mins = session_sec // 60
+    total_mins = total_today_sec // 60
+    remain_mins = max(0, COLAB_FREE_DAILY_BUDGET_MIN - total_mins)
+    remain_pct = max(0, min(100, int(remain_mins * 100 / COLAB_FREE_DAILY_BUDGET_MIN)))
+
+    if session_mins < 1:
+        up_part = "방금 시동"
+    elif session_mins < 60:
+        up_part = f"{session_mins}분 가동"
+    else:
+        up_part = f"{session_mins // 60}시간 {session_mins % 60:02d}분 가동"
+
+    if remain_mins >= 60:
+        rem_part = f"예상 잔여 {remain_mins // 60}시간 {remain_mins % 60:02d}분 ({remain_pct}%)"
+    elif remain_mins > 0:
+        rem_part = f"예상 잔여 약 {remain_mins}분 ({remain_pct}% · 주의)"
+    else:
+        rem_part = "일일 무료 한도 임박 (종료 시 내 PC 자동 전환)"
+    return f"{up_part} · {rem_part}"
+
+
+def _get_colab_quota_level(started_at: float = 0.0) -> str:
+    ts = started_at or float(_LAST_COLAB_CHECK.get("started_at") or load_settings().get("colab_started_at") or 0.0)
+    session_sec = max(0, int(time.time() - ts)) if ts > 0 else 0
+    total_mins = (_get_today_past_colab_sec() + session_sec) // 60
+    remain_mins = COLAB_FREE_DAILY_BUDGET_MIN - total_mins
+    if remain_mins <= 15:
+        return "danger"
+    if remain_mins <= 45:
+        return "warn"
+    return "ok"
 
 
 def get_colab_client(url: str) -> Client:
@@ -399,11 +444,15 @@ def get_colab_client(url: str) -> Client:
     return _COLAB_CLIENT_CACHE[url]
 
 
-def render_status_badge(text: str, is_online: bool = True) -> str:
-    dot_color = "#10B981" if is_online else "#52525B"
-    bg_color = "#ECFDF5" if is_online else "#F4F4F5"
-    border_color = "rgba(16, 185, 129, 0.3)" if is_online else "#D4D4D8"
-    text_color = "#065F46" if is_online else "#27272A"
+def render_status_badge(text: str, is_online: bool = True, level: str = "") -> str:
+    if not is_online:
+        dot_color, bg_color, border_color, text_color = "#52525B", "#F4F4F5", "#D4D4D8", "#27272A"
+    elif level == "danger":
+        dot_color, bg_color, border_color, text_color = "#EF4444", "#FEF2F2", "rgba(239, 68, 68, 0.35)", "#991B1B"
+    elif level == "warn":
+        dot_color, bg_color, border_color, text_color = "#F59E0B", "#FFFBEB", "rgba(245, 158, 11, 0.35)", "#92400E"
+    else:
+        dot_color, bg_color, border_color, text_color = "#10B981", "#ECFDF5", "rgba(16, 185, 129, 0.3)", "#065F46"
     return f"""
     <div style="display:inline-flex;align-items:center;gap:8px;background:{bg_color};border:1px solid {border_color};border-radius:999px;padding:6px 14px;font-size:13px;font-weight:600;color:{text_color};white-space:nowrap;max-width:100%;">
         <span style="width:8px;height:8px;border-radius:50%;background:{dot_color};flex-shrink:0;display:inline-block;"></span>
@@ -415,9 +464,14 @@ def render_status_badge(text: str, is_online: bool = True) -> str:
 def get_status_label(force_refresh: bool = False) -> str:
     url = get_colab_url(force_refresh=force_refresh)
     if url:
-        short_host = url.replace("https://", "").replace("http://", "").split("/")[0]
         uptime_str = format_colab_uptime()
-        return render_status_badge(f"코랩 GPU 연결됨 · {uptime_str} · {short_host}", is_online=True)
+        lvl = _get_colab_quota_level()
+        return render_status_badge(f"코랩 GPU · {uptime_str}", is_online=True, level=lvl)
+    past_mins = _get_today_past_colab_sec() // 60
+    if past_mins > 0:
+        rem_mins = max(0, COLAB_FREE_DAILY_BUDGET_MIN - past_mins)
+        rem_pct = max(0, min(100, int(rem_mins * 100 / COLAB_FREE_DAILY_BUDGET_MIN)))
+        return render_status_badge(f"내 PC 단독 모드 (오늘 코랩 {past_mins}분 사용 · 예상 잔여 {rem_pct}%)", is_online=False)
     return render_status_badge("내 PC 단독 모드 (코랩 없이 즉시 생성)", is_online=False)
 
 
@@ -457,9 +511,9 @@ def _send_colab_autorun_keys():
 def auto_start_colab_from_pc():
     already_url = get_colab_url(force_refresh=True)
     if already_url:
-        short_host = already_url.replace("https://", "").replace("http://", "").split("/")[0]
         uptime_str = format_colab_uptime()
-        yield render_status_badge(f"코랩 GPU 연결됨 · {uptime_str} · {short_host}", is_online=True), f"이미 코랩 GPU가 연결되어 있습니다 ({uptime_str})."
+        lvl = _get_colab_quota_level()
+        yield render_status_badge(f"코랩 GPU · {uptime_str}", is_online=True, level=lvl), f"이미 코랩 GPU가 연결되어 있습니다 ({uptime_str})."
         return
 
     unlock_windows_foreground()
@@ -473,7 +527,8 @@ def auto_start_colab_from_pc():
         if url:
             short_host = url.replace("https://", "").replace("http://", "").split("/")[0]
             uptime_str = format_colab_uptime()
-            yield render_status_badge(f"코랩 GPU 연결됨 · {uptime_str} · {short_host}", is_online=True), f"코랩 GPU 연결 완료 ({short_host})"
+            lvl = _get_colab_quota_level()
+            yield render_status_badge(f"코랩 GPU · {uptime_str}", is_online=True, level=lvl), f"코랩 GPU 연결 완료 ({short_host})"
             return
         yield render_status_badge(f"코랩 시동 대기 ({sec}초)...", is_online=False), f"코랩 준비 중 ({sec}초) · 지금 바로 합성 가능"
 
@@ -483,7 +538,9 @@ def auto_start_colab_from_pc():
 def shutdown_remote_colab(colab_url_input: str):
     url = get_colab_url(colab_url_input, force_refresh=True)
     if not url:
-        return render_status_badge("내 PC 단독 모드 (코랩 없이 즉시 생성)", is_online=False), "현재 연결된 코랩 세션이 없습니다."
+        return get_status_label(force_refresh=False), "현재 연결된 코랩 세션이 없습니다."
+    prev_started = float(_LAST_COLAB_CHECK.get("started_at") or load_settings().get("colab_started_at") or 0.0)
+    _record_finished_colab_session(prev_started)
     try:
         c = get_colab_client(url)
         c.predict(api_name="/shutdown_colab")
@@ -506,7 +563,7 @@ def shutdown_remote_colab(colab_url_input: str):
     _LAST_COLAB_CHECK["url"] = ""
     _LAST_COLAB_CHECK["started_at"] = 0.0
     _LAST_COLAB_CHECK["ts"] = time.time()
-    return render_status_badge("내 PC 단독 모드 (코랩 없이 즉시 생성)", is_online=False), "코랩 GPU 세션을 안전하게 반납(종료)했습니다."
+    return get_status_label(force_refresh=False), "코랩 GPU 세션을 안전하게 반납(종료)했습니다."
 
 
 # ==============================================================================
