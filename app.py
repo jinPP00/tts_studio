@@ -94,7 +94,7 @@ _LOCAL_FISH_ENGINE = None
 _ENGINE_LOCK = threading.Lock()
 _CANCEL_REQUESTED = False
 _COLAB_CLIENT_CACHE: dict[str, Client] = {}
-_LAST_COLAB_CHECK = {"ts": 0.0, "url": ""}
+_LAST_COLAB_CHECK = {"ts": 0.0, "url": "", "started_at": 0.0}
 _REF_BYTES_CACHE: dict[str, bytes] = {}
 _AUDIO_HTML_CACHE: dict[tuple, str] = {}
 _SETTINGS_MEM_CACHE: dict = {"mtime": -1, "data": {}}
@@ -304,22 +304,31 @@ def is_colab_alive(url: str) -> bool:
 
 
 def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> str:
+    now = time.time()
+    cfg = load_settings()
     if custom_colab_url and custom_colab_url.strip().startswith("http"):
         url = custom_colab_url.strip()
         if is_colab_alive(url):
-            save_settings({"colab_url": url})
-            _LAST_COLAB_CHECK["ts"] = time.time()
+            prev_url = cfg.get("colab_url", "").strip()
+            started_at = float(cfg.get("colab_started_at") or now) if prev_url == url else now
+            save_settings({"colab_url": url, "colab_started_at": started_at})
+            _LAST_COLAB_CHECK["ts"] = now
             _LAST_COLAB_CHECK["url"] = url
+            _LAST_COLAB_CHECK["started_at"] = started_at
             return url
 
-    now = time.time()
     if not force_refresh and _LAST_COLAB_CHECK["url"] and (now - _LAST_COLAB_CHECK["ts"] < 12.0):
         return _LAST_COLAB_CHECK["url"]
 
-    saved = load_settings().get("colab_url", "").strip()
+    saved = cfg.get("colab_url", "").strip()
+    saved_started = float(cfg.get("colab_started_at") or 0.0)
     if not force_refresh and saved and is_colab_alive(saved):
+        if saved_started <= 0:
+            saved_started = now
+            save_settings({"colab_started_at": saved_started})
         _LAST_COLAB_CHECK["ts"] = now
         _LAST_COLAB_CHECK["url"] = saved
+        _LAST_COLAB_CHECK["started_at"] = saved_started
         return saved
 
     try:
@@ -329,9 +338,13 @@ def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> st
         )
         with urllib.request.urlopen(req, timeout=4.5) as resp:
             lines = [json.loads(line) for line in resp.read().decode("utf-8").splitlines() if line.strip()]
-            msgs = [m.get("message", "").strip() for m in lines if m.get("event") == "message"]
+            msg_items = [
+                (m.get("message", "").strip(), float(m.get("time") or now))
+                for m in lines
+                if m.get("event") == "message"
+            ]
             checked = set()
-            for msg in reversed(msgs):
+            for msg, msg_time in reversed(msg_items):
                 if msg == "RESET_OLD_COLAB":
                     break
                 if msg.startswith("https://") and "gradio.live" in msg and "33eb403275e9404ad6" not in msg and "test-colab" not in msg:
@@ -339,9 +352,10 @@ def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> st
                         continue
                     checked.add(msg)
                     if is_colab_alive(msg):
-                        save_settings({"colab_url": msg})
+                        save_settings({"colab_url": msg, "colab_started_at": msg_time})
                         _LAST_COLAB_CHECK["ts"] = now
                         _LAST_COLAB_CHECK["url"] = msg
+                        _LAST_COLAB_CHECK["started_at"] = msg_time
                         return msg
                     if len(checked) >= 2:
                         break
@@ -349,13 +363,33 @@ def get_colab_url(custom_colab_url: str = "", force_refresh: bool = False) -> st
         pass
 
     if saved and is_colab_alive(saved):
+        if saved_started <= 0:
+            saved_started = now
+            save_settings({"colab_started_at": saved_started})
         _LAST_COLAB_CHECK["ts"] = now
         _LAST_COLAB_CHECK["url"] = saved
+        _LAST_COLAB_CHECK["started_at"] = saved_started
         return saved
 
     _LAST_COLAB_CHECK["ts"] = now
     _LAST_COLAB_CHECK["url"] = ""
+    _LAST_COLAB_CHECK["started_at"] = 0.0
     return ""
+
+
+def format_colab_uptime(started_at: float = 0.0) -> str:
+    ts = started_at or float(_LAST_COLAB_CHECK.get("started_at") or load_settings().get("colab_started_at") or 0.0)
+    if ts <= 0:
+        return "방금 시동됨"
+    elapsed_sec = max(0, int(time.time() - ts))
+    mins = elapsed_sec // 60
+    if mins < 1:
+        return "방금 시동됨 (1분 미만)"
+    if mins < 60:
+        return f"{mins}분째 가동 중 (무료 약 2~3시간)"
+    hours = mins // 60
+    rem_mins = mins % 60
+    return f"{hours}시간 {rem_mins:02d}분째 가동 중 (무료 약 2~3시간)"
 
 
 def get_colab_client(url: str) -> Client:
@@ -382,20 +416,38 @@ def get_status_label(force_refresh: bool = False) -> str:
     url = get_colab_url(force_refresh=force_refresh)
     if url:
         short_host = url.replace("https://", "").replace("http://", "").split("/")[0]
-        return render_status_badge(f"코랩 GPU 연결됨 · {short_host}", is_online=True)
+        uptime_str = format_colab_uptime()
+        return render_status_badge(f"코랩 GPU 연결됨 · {uptime_str} · {short_host}", is_online=True)
     return render_status_badge("내 PC 단독 모드 (코랩 없이 즉시 생성)", is_online=False)
 
 
 def _send_colab_autorun_keys():
+    """코랩 새 탭 로드 완료 감지 후 브라우저 창을 전면 활성화하고 Ctrl+F9 및 경고창 '무시하고 계속하기'(Tab 3회 + Enter) 자동 실행"""
     if sys.platform != "win32":
         return
     try:
         ps_script = (
+            "Add-Type -Name WinColab -Namespace U32 -MemberDefinition '"
+            "[DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h); "
+            "[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int c);' -ErrorAction SilentlyContinue; "
             "$ws = New-Object -ComObject WScript.Shell; "
-            "Start-Sleep -Milliseconds 6500; "
+            "$targetHwnd = [IntPtr]::Zero; "
+            "for ($i = 0; $i -lt 24; $i++) { "
+            "  Start-Sleep -Milliseconds 500; "
+            "  $p = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and ($_.MainWindowTitle -match 'fish_tts_studio|Colab') } | Select-Object -First 1; "
+            "  if ($p) { $targetHwnd = $p.MainWindowHandle; break } "
+            "} "
+            "Start-Sleep -Milliseconds 3000; "
+            "if ($targetHwnd -ne [IntPtr]::Zero) { "
+            "  [U32.WinColab]::ShowWindow($targetHwnd, 9) | Out-Null; "
+            "  [U32.WinColab]::SetForegroundWindow($targetHwnd) | Out-Null; "
+            "  $ws.AppActivate('Colab') | Out-Null; "
+            "} "
+            "Start-Sleep -Milliseconds 400; "
             "$ws.SendKeys('^{F9}'); "
-            "Start-Sleep -Milliseconds 1500; "
-            "$ws.SendKeys('{TAB}{ENTER}');"
+            "Start-Sleep -Milliseconds 2000; "
+            "if ($targetHwnd -ne [IntPtr]::Zero) { [U32.WinColab]::SetForegroundWindow($targetHwnd) | Out-Null } "
+            "$ws.SendKeys('{TAB}{TAB}{TAB}{ENTER}');"
         )
         _create_process_on_user_desktop(f'powershell.exe -NoProfile -WindowStyle Hidden -Command "{ps_script}"', show_window=0)
     except Exception:
@@ -406,20 +458,22 @@ def auto_start_colab_from_pc():
     already_url = get_colab_url(force_refresh=True)
     if already_url:
         short_host = already_url.replace("https://", "").replace("http://", "").split("/")[0]
-        yield render_status_badge(f"코랩 GPU 연결됨 · {short_host}", is_online=True), "이미 코랩 GPU가 연결되어 있습니다."
+        uptime_str = format_colab_uptime()
+        yield render_status_badge(f"코랩 GPU 연결됨 · {uptime_str} · {short_host}", is_online=True), f"이미 코랩 GPU가 연결되어 있습니다 ({uptime_str})."
         return
 
     unlock_windows_foreground()
     _create_process_on_user_desktop(f'cmd.exe /c start "" "{COLAB_DIRECT_URL}"', show_window=0)
     threading.Thread(target=_send_colab_autorun_keys, daemon=True).start()
-    yield render_status_badge("코랩 GPU 시동 중...", is_online=False), "코랩 자동 시동 중 (기다리지 않고 바로 합성 가능)"
+    yield render_status_badge("코랩 GPU 자동 시동 중...", is_online=False), "코랩 새 탭 열기 및 자동 실행 중 (기다리지 않고 바로 합성 가능)"
 
     for sec in range(4, 95, 4):
         time.sleep(4.0)
         url = get_colab_url(force_refresh=True)
         if url:
             short_host = url.replace("https://", "").replace("http://", "").split("/")[0]
-            yield render_status_badge(f"코랩 GPU 연결됨 · {short_host}", is_online=True), f"코랩 GPU 연결 완료 ({short_host})"
+            uptime_str = format_colab_uptime()
+            yield render_status_badge(f"코랩 GPU 연결됨 · {uptime_str} · {short_host}", is_online=True), f"코랩 GPU 연결 완료 ({short_host})"
             return
         yield render_status_badge(f"코랩 시동 대기 ({sec}초)...", is_online=False), f"코랩 준비 중 ({sec}초) · 지금 바로 합성 가능"
 
@@ -448,8 +502,9 @@ def shutdown_remote_colab(colab_url_input: str):
     except Exception:
         pass
     _COLAB_CLIENT_CACHE.clear()
-    save_settings({"colab_url": ""})
+    save_settings({"colab_url": "", "colab_started_at": 0.0})
     _LAST_COLAB_CHECK["url"] = ""
+    _LAST_COLAB_CHECK["started_at"] = 0.0
     _LAST_COLAB_CHECK["ts"] = time.time()
     return render_status_badge("내 PC 단독 모드 (코랩 없이 즉시 생성)", is_online=False), "코랩 GPU 세션을 안전하게 반납(종료)했습니다."
 
@@ -1802,7 +1857,10 @@ initial_latest_out_path = str(initial_recent_files[0]) if initial_recent_files e
 initial_output_html = render_audio_html(initial_latest_out_path, "완성본", autoplay=False)
 initial_saved_colab = initial_cfg.get("colab_url", "").strip()
 initial_badge_html = (
-    render_status_badge(f"코랩 GPU 연결됨 · {initial_saved_colab.replace('https://', '').split('/')[0]}", is_online=True)
+    render_status_badge(
+        f"코랩 GPU 연결됨 · {format_colab_uptime(float(initial_cfg.get('colab_started_at') or 0.0))} · {initial_saved_colab.replace('https://', '').split('/')[0]}",
+        is_online=True,
+    )
     if initial_saved_colab
     else render_status_badge("내 PC 단독 모드 (코랩 없이 즉시 생성)", is_online=False)
 )
