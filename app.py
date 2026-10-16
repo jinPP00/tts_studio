@@ -765,11 +765,16 @@ def render_audio_html(file_path, label: str = "오디오 미리듣기", autoplay
         if not autoplay and cache_key in _AUDIO_HTML_CACHE:
             return _AUDIO_HTML_CACHE[cache_key]
 
-        raw_bytes = p.read_bytes()
-        size_kb = len(raw_bytes) // 1024
-        b64 = base64.b64encode(raw_bytes).decode("ascii")
+        size_kb = st.st_size // 1024
+        size_label = f"{st.st_size / (1024 * 1024):.1f} MB" if size_kb >= 10240 else f"{size_kb} KB"
         ext = p.suffix.lower().lstrip(".")
         mime = "audio/mpeg" if ext == "mp3" else ("audio/mp4" if ext == "m4a" else "audio/wav")
+        if st.st_size <= 15 * 1024 * 1024:
+            b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+            audio_src = f"data:{mime};base64,{b64}"
+        else:
+            from urllib.parse import quote
+            audio_src = f"/gradio_api/file={quote(str(p.resolve()))}?t={st.st_mtime_ns}"
         auto_attr = "autoplay" if autoplay else ""
         safe_name = html.escape(p.name, quote=True)
         safe_label = html.escape(label, quote=True)
@@ -781,14 +786,14 @@ def render_audio_html(file_path, label: str = "오디오 미리듣기", autoplay
                     <span class="audio-filename" title="{safe_name}">{safe_name}</span>
                 </div>
                 <div class="audio-meta-wrap">
-                    <span class="audio-size">{size_kb} KB</span>
+                    <span class="audio-size">{size_label}</span>
                     <a href="#" data-fn="{safe_name}" class="audio-dl-btn" onclick="const c=this.closest('.audio-player-card');const a=document.createElement('a');a.href=c.querySelector('audio').src;a.download=this.dataset.fn;a.click();return false;">저장</a>
                 </div>
             </div>
-            <audio controls {auto_attr} preload="auto" class="studio-audio-el" src="data:{mime};base64,{b64}"></audio>
+            <audio controls {auto_attr} preload="metadata" class="studio-audio-el" src="{audio_src}"></audio>
         </div>
         """
-        if not autoplay:
+        if not autoplay and st.st_size <= 15 * 1024 * 1024:
             if len(_AUDIO_HTML_CACHE) > 24:
                 _AUDIO_HTML_CACHE.clear()
             _AUDIO_HTML_CACHE[cache_key] = card_html
@@ -942,7 +947,7 @@ def fast_trim_silence(wav: np.ndarray, sr: int, top_db: float = 28.0) -> np.ndar
 
 
 def save_processed_audio(src_path: str, dst_path: Path, speed: float, trim_silence: bool):
-    """후처리(무음 제거 · 배속 조절) 후 임시 파일 복사 없이 최종 경로에 직접 저장"""
+    """후처리(무음 제거 · 배속 조절) 후 임시 파일 복사 없이 최종 경로에 직접 저장 (1시간 장문 메모리 최적화 포함)"""
     try:
         if abs(speed - 1.0) < 0.02 and not trim_silence:
             shutil.copy2(src_path, dst_path)
@@ -953,7 +958,16 @@ def save_processed_audio(src_path: str, dst_path: Path, speed: float, trim_silen
         if trim_silence:
             wav = fast_trim_silence(wav, sr, top_db=28.0)
         if abs(speed - 1.0) >= 0.02:
-            wav = librosa.effects.time_stretch(wav, rate=float(speed))
+            rate = float(speed)
+            win = sr * 45
+            if wav.shape[0] <= sr * 60:
+                wav = librosa.effects.time_stretch(wav, rate=rate)
+            else:
+                parts = [
+                    librosa.effects.time_stretch(wav[i : i + win], rate=rate)
+                    for i in range(0, wav.shape[0], win)
+                ]
+                wav = np.concatenate(parts)
         sf.write(str(dst_path), wav, sr, subtype="PCM_16")
     except Exception:
         shutil.copy2(src_path, dst_path)
@@ -1107,7 +1121,7 @@ def request_cancel():
     return "합성 중단됨"
 
 
-def split_script_into_chunks(text: str, max_chars: int = 85) -> list[str]:
+def split_script_into_chunks(text: str, max_chars: int = 115) -> list[str]:
     clean = (text or "").strip()
     if not clean:
         return []
@@ -1291,7 +1305,7 @@ def generate_cloned_voice(
 
     trimmed_path = prepare_10s_wav(audio_path)
     target_clean = target_text.strip()
-    chunks = split_script_into_chunks(target_clean, max_chars=85)
+    chunks = split_script_into_chunks(target_clean, max_chars=115)
 
     if engine_choice == "코랩 GPU":
         engines = ["colab"]
@@ -1300,54 +1314,63 @@ def generate_cloned_voice(
     else:
         engines = ["colab", "local_fish"]
 
-    combined_wavs: list[np.ndarray] = []
     sr_final = 44100
     used_engines: list[str] = []
+    synth_times: list[float] = []
 
-    for idx, chunk_str in enumerate(chunks, start=1):
-        if _CANCEL_REQUESTED:
-            yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
-            return
+    with sf.SoundFile(str(LAST_RAW_WAV), mode="w", samplerate=sr_final, channels=1, subtype="PCM_16", format="WAV") as raw_writer:
+        for idx, chunk_str in enumerate(chunks, start=1):
+            if _CANCEL_REQUESTED:
+                yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
+                return
 
-        if len(chunks) > 1:
-            yield gr.update(), "", f"음성 합성 중 ({idx}/{len(chunks)} 문장) · {chunk_str[:22]}...", get_saved_files_table(str(out_dir))
-        else:
-            cache_probe = _get_synth_cache_path(trimmed_path, clean_ref, chunk_str, float(temp_val))
-            if not cache_probe.exists():
-                yield gr.update(), "", "음성 합성 중...", get_saved_files_table(str(out_dir))
+            if len(chunks) > 1:
+                pct = int((idx - 1) * 100 / len(chunks))
+                if synth_times:
+                    avg_sec = sum(synth_times) / len(synth_times)
+                    rem_sec = int(avg_sec * (len(chunks) - idx + 1))
+                    eta_str = f" · 남은 시간 약 {rem_sec // 60}분 {rem_sec % 60}초" if rem_sec >= 60 else (f" · 남은 시간 약 {rem_sec}초" if rem_sec > 2 else "")
+                else:
+                    eta_str = ""
+                yield gr.update(), "", f"음성 합성 중 ({idx}/{len(chunks)} · {pct}%{eta_str}) · {chunk_str[:18]}...", get_saved_files_table(str(out_dir))
+            else:
+                cache_probe = _get_synth_cache_path(trimmed_path, clean_ref, chunk_str, float(temp_val))
+                if not cache_probe.exists():
+                    yield gr.update(), "", "음성 합성 중...", get_saved_files_table(str(out_dir))
 
-        chunk_wav_path, used_eng, errs = _synthesize_single_chunk(
-            chunk_str,
-            voice_name,
-            trimmed_path,
-            clean_ref,
-            float(temp_val),
-            engines,
-            colab_url_input,
-            engine_choice,
-        )
-        if _CANCEL_REQUESTED:
-            yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
-            return
-        if not chunk_wav_path or not chunk_wav_path.exists():
-            yield gr.update(), "", "합성 실패 · " + " / ".join(errs), get_saved_files_table(str(out_dir))
-            return
+            t_chunk = time.time()
+            chunk_wav_path, used_eng, errs = _synthesize_single_chunk(
+                chunk_str,
+                voice_name,
+                trimmed_path,
+                clean_ref,
+                float(temp_val),
+                engines,
+                colab_url_input,
+                engine_choice,
+            )
+            dt_chunk = time.time() - t_chunk
+            if dt_chunk > 0.1:
+                synth_times.append(dt_chunk)
 
-        if used_eng and used_eng not in used_engines:
-            used_engines.append(used_eng)
+            if _CANCEL_REQUESTED:
+                yield gr.update(), "", "합성 중단됨", get_saved_files_table(str(out_dir))
+                return
+            if not chunk_wav_path or not chunk_wav_path.exists():
+                yield gr.update(), "", "합성 실패 · " + " / ".join(errs), get_saved_files_table(str(out_dir))
+                return
 
-        wav_part, sr_part = sf.read(str(chunk_wav_path), dtype="float32", always_2d=False)
-        if wav_part.ndim > 1:
-            wav_part = np.mean(wav_part, axis=1)
-        sr_final = sr_part
-        if bool(trim_val) and len(chunks) > 1:
-            wav_part = fast_trim_silence(wav_part, sr_final, top_db=28.0)
-        combined_wavs.append(wav_part)
-        if idx < len(chunks):
-            combined_wavs.append(np.zeros(int(sr_final * 0.18), dtype=np.float32))
+            if used_eng and used_eng not in used_engines:
+                used_engines.append(used_eng)
 
-    full_raw_wav = np.concatenate(combined_wavs) if len(combined_wavs) > 1 else combined_wavs[0]
-    sf.write(str(LAST_RAW_WAV), full_raw_wav, sr_final, subtype="PCM_16")
+            wav_part, sr_part = sf.read(str(chunk_wav_path), dtype="float32", always_2d=False)
+            if wav_part.ndim > 1:
+                wav_part = np.mean(wav_part, axis=1)
+            if len(chunks) > 1:
+                wav_part = fast_trim_silence(wav_part, sr_part, top_db=28.0)
+            raw_writer.write(wav_part)
+            if idx < len(chunks):
+                raw_writer.write(np.zeros(int(sr_part * 0.18), dtype=np.float32))
 
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     preview_slug = re.sub(r"[^가-힣a-zA-Z0-9]", "", target_clean)[:12] or "tts"
