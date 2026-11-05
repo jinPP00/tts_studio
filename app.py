@@ -39,7 +39,7 @@ import gradio as gr
 from gradio_client import Client, handle_file
 
 SETTINGS_FILE = STUDIO_DIR / "settings.json"
-DESKTOP_OUT_DIR = Path.home() / "Desktop" / "TTS_완성본"
+DESKTOP_OUT_DIR = STUDIO_DIR / "outputs"
 DOWNLOADS_OUT_DIR = Path.home() / "Downloads" / "TTS_완성본"
 G_DRIVE_BASE = next(
     (p for p in [Path(r"G:\내 드라이브\TTS"), Path(r"G:\My Drive\TTS"), Path(r"H:\내 드라이브\TTS")] if p.parent.exists()),
@@ -1171,6 +1171,48 @@ def browse_custom_folder(current_dir: str):
     return current_dir, get_preset_name_for_dir(current_dir), get_saved_files_table(current_dir), "폴더 변경 취소됨"
 
 
+EMOTIONAL_SCRIPT_PRESETS: dict[str, str] = {
+    "직접 입력 (기본 테스트 문장)": "안녕하세요. 테스트 음성입니다.",
+    "🎭 [희노애락 올라운드] 4단 감정 변화 표준 대본": (
+        "세상에, 이게 정말 가능한 일인가요? 처음엔 설마 했는데 제 눈으로 직접 보니까 심장이 막 뛰네요! "
+        "아니, 대체 왜 이런 중요한 사실을 지금까지 아무도 알려주지 않았던 거죠? "
+        "솔직히 혼자 고민하던 시간들이 조금은 서럽고 막막했거든요. "
+        "하지만 이제라도 제대로 알게 됐으니, 오늘부터 완전히 새롭게 시작해 보려고 합니다."
+    ),
+    "⚡ [유튜브 쇼츠·릴스] 첫 3초 초고밀도 후킹 대본 (필재·진우·박창수·발키리·스텔라 추천)": (
+        "잠깐만요! 지금 그냥 스크롤 넘기시면 오늘 진짜 큰일 납니다! "
+        "여러분, 우리가 매일 무심코 하던 이 습관 하나 때문에 통장 잔고가 줄줄 새고 있었다는 사실, 알고 계셨나요? "
+        "에이, 설마 내가 그러겠어 싶으시죠? 지금 딱 10초만 집중해 보세요. 결과가 완전히 달라집니다!"
+    ),
+    "🎬 [영화·드라마·웹소설 리뷰] 몰입감 & 서스펜스 대본 (강일·이현·문정·혁·루아크 추천)": (
+        "모두가 평화롭게 잠든 그날 밤, 닫혀 있던 방문 너머로 낯선 발소리가 조용히 멈춰 섰습니다. "
+        "아무도 믿을 수 없는 극한의 상황 속에서 주인공이 선택할 수 있는 길은 단 하나뿐이었죠. "
+        "과연 그 문고리를 돌리는 순간, 어떤 충격적인 진실이 기다리고 있었을까요?"
+    ),
+    "📊 [경제·IT·지식 브리핑] 신뢰감 & 설득력 대본 (현준·민욱·은경·민호·해리 추천)": (
+        "최근 글로벌 시장의 흐름을 살펴보면, 기존의 상식을 완전히 뒤집는 놀라운 변화가 감지되고 있습니다. "
+        "핵심은 단순한 기술의 발전이 아니라, 소비자의 선택 기준이 근본적으로 이동했다는 점인데요. "
+        "오늘 영상에서는 앞으로 3년간 시장을 주도할 핵심 트렌드 세 가지를 가장 알기 쉽게 짚어드리겠습니다."
+    ),
+    "🌙 [다큐·인생사연·라디오] 깊은 여운 & 감성 위로 대본 (준성·권일·종대·경애·데이비드 추천)": (
+        "바쁘게 달려온 하루 끝에서 문득 걸음을 멈추고 뒤를 돌아볼 때가 있습니다. "
+        "그때는 참 견디기 힘들었던 순간들도, 시간이 흘러 돌아보니 결국 나를 더 단단하게 만들어 준 계절이었더라고요. "
+        "오늘 밤만큼은 무거운 짐을 잠시 내려놓고, 당신의 마음에도 따뜻한 위로가 찾아오기를 바랍니다."
+    ),
+    "🔍 [사건사고·미스터리 실화] 묵직한 긴장감 대본 (대진·강기자·혁·최 추천)": (
+        "사건 현장에 남겨진 단서는 단 한 장의 메모뿐이었습니다. "
+        "수사팀이 수개월간 추적한 끝에 밝혀낸 범인의 정체는, 놀랍게도 피해자와 가장 가까운 곳에 있던 인물이었는데요. "
+        "치밀하게 숨겨져 있던 그날의 전말을 지금 바로 공개합니다."
+    ),
+}
+
+
+def on_script_preset_select(preset_key: str):
+    if not preset_key or preset_key not in EMOTIONAL_SCRIPT_PRESETS:
+        return gr.update()
+    return EMOTIONAL_SCRIPT_PRESETS[preset_key]
+
+
 def refresh_all(current_out_dir: str):
     choices = get_sample_files()
     first = choices[0] if choices else None
@@ -1183,6 +1225,19 @@ def refresh_all(current_out_dir: str):
         "",
         get_status_label(force_refresh=True),
         get_saved_files_table(current_out_dir),
+    )
+
+
+def on_page_load(current_voice: str):
+    choices = get_sample_files()
+    selected = current_voice if (current_voice in choices) else (choices[0] if choices else None)
+    preview_html, ref_text, sample_path_str = on_voice_select(selected)
+    return (
+        get_status_label(force_refresh=True),
+        gr.update(choices=choices, value=selected),
+        preview_html,
+        ref_text,
+        sample_path_str,
     )
 
 
@@ -2000,6 +2055,12 @@ with gr.Blocks(title="Voice Studio") as demo:
         # 우측: 대본 입력 & 결과 오디오
         with gr.Column(scale=7, elem_classes="studio-card"):
             gr.HTML('<div class="section-heading"><span>03 · 음성 합성</span><span style="font-size:11.5px;color:#71717A;font-weight:500;">Ctrl+Enter 바로 시작</span></div>')
+            script_preset_dropdown = gr.Dropdown(
+                choices=list(EMOTIONAL_SCRIPT_PRESETS.keys()),
+                value="직접 입력 (기본 테스트 문장)",
+                show_label=False,
+                container=False,
+            )
             target_text_box = gr.Textbox(
                 value="안녕하세요. 테스트 음성입니다.",
                 lines=2,
@@ -2066,6 +2127,12 @@ with gr.Blocks(title="Voice Studio") as demo:
         fn=on_voice_select,
         inputs=[voice_dropdown],
         outputs=[sample_audio_html, ref_text_state, sample_path_state],
+        queue=False,
+    )
+    script_preset_dropdown.change(
+        fn=on_script_preset_select,
+        inputs=[script_preset_dropdown],
+        outputs=[target_text_box],
         queue=False,
     )
     new_upload.upload(
@@ -2165,9 +2232,9 @@ with gr.Blocks(title="Voice Studio") as demo:
         queue=False,
     )
     demo.load(
-        fn=lambda: get_status_label(force_refresh=True),
-        inputs=[],
-        outputs=[colab_status_txt],
+        fn=on_page_load,
+        inputs=[voice_dropdown],
+        outputs=[colab_status_txt, voice_dropdown, sample_audio_html, ref_text_state, sample_path_state],
         queue=False,
     )
 
