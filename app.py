@@ -28,7 +28,7 @@ os.environ["EINX_FILTER_TRACEBACK"] = "false"
 # ==============================================================================
 STUDIO_DIR = Path(__file__).resolve().parent
 FISH_ROOT = STUDIO_DIR / "fish-speech"
-CKPT_DIR = FISH_ROOT / "checkpoints" / "fish-speech-1.5"
+CKPT_DIR = Path(r"D:\project_cache\tts_studio\checkpoints\fish-speech-1.5") if Path(r"D:\").exists() else (FISH_ROOT / "checkpoints" / "fish-speech-1.5")
 if str(FISH_ROOT) not in sys.path:
     sys.path.insert(0, str(FISH_ROOT))
 
@@ -39,7 +39,7 @@ import gradio as gr
 from gradio_client import Client, handle_file
 
 SETTINGS_FILE = STUDIO_DIR / "settings.json"
-DESKTOP_OUT_DIR = STUDIO_DIR / "outputs"
+DESKTOP_OUT_DIR = Path(r"D:\project_outputs\tts_studio") if Path(r"D:\project_outputs\tts_studio").exists() else (STUDIO_DIR / "outputs")
 DOWNLOADS_OUT_DIR = Path.home() / "Downloads" / "TTS_완성본"
 G_DRIVE_BASE = next(
     (p for p in [Path(r"G:\내 드라이브\TTS"), Path(r"G:\My Drive\TTS"), Path(r"H:\내 드라이브\TTS")] if p.parent.exists()),
